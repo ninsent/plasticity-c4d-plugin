@@ -1,15 +1,6 @@
 """
 Main dialog for Plasticity Bridge plugin.
 
-Changes from original:
-  Bug 1 fixed : RestoreLayout now calls self.Restore() not self.Open()
-  Bug 4 fixed : _update_ui_state() called on EVERY timer tick, not only when
-                events arrive — status messages from StatusReporter now show
-                immediately.
-  Feature 7   : Unit Scale slider added; drives SceneHandler.update_unit_scale()
-                which applies scale to root null transforms without re-importing.
-  Feature 8   : NEW_VERSION callback updates status label with "refresh available"
-                message; NEW_FILE updates filename label automatically.
   Utilities   : All utility buttons removed from UI; a placeholder label
                 informs the user they are coming soon.
 """
@@ -107,6 +98,13 @@ class PlasticityDialog(gui.GeDialog):
         bridge.register_callback(EventType.CONNECTION_ERROR, self._on_connection_error)
         bridge.register_callback(EventType.NEW_VERSION,      self._on_new_version)
         bridge.register_callback(EventType.NEW_FILE,         self._on_new_file)
+
+        # Fix #2: Register completion callbacks that clear _busy for specific events
+        bridge.register_callback(EventType.LIST_RESPONSE,    self._on_operation_complete)
+        bridge.register_callback(EventType.REFACET_RESPONSE, self._on_operation_complete)
+
+        # Fix #6: Send failures push STATUS_UPDATE — clear _busy so dialog isn't stuck
+        bridge.register_callback(EventType.STATUS_UPDATE,    self._on_status_update)
 
     # =========================================================================
     # Layout
@@ -290,14 +288,11 @@ class PlasticityDialog(gui.GeDialog):
         """
         Called every TIMER_INTERVAL ms by Cinema 4D on the main thread.
 
-        Bug 4 fix: _update_ui_state() is called unconditionally on every tick
-        so that status messages written by StatusReporter (which updates
-        bridge.status_message directly without pushing a queue event) appear
-        immediately in the Status label.
+        Fix #2: _busy is NOT cleared here. It is only cleared by specific
+        completion callbacks (_on_operation_complete, _on_connected, etc.).
+        _update_ui_state() runs unconditionally so status labels stay current.
         """
-        count = self.bridge.process_pending_events()
-        if count > 0:
-            self._busy = False
+        self.bridge.process_pending_events()
         # Always refresh labels — catches status_message changes between events
         self._update_ui_state()
 
@@ -394,12 +389,26 @@ class PlasticityDialog(gui.GeDialog):
         error = event.error_message or "Unknown error"
         gui.MessageDialog(f"Connection error:\n{error}")
 
+    def _on_operation_complete(self, event: BridgeEvent):
+        """
+        Fix #2: Clear _busy only when the actual list/refacet response arrives.
+        This callback is registered for LIST_RESPONSE and REFACET_RESPONSE only.
+        """
+        self._busy = False
+
+    def _on_status_update(self, event: BridgeEvent):
+        """
+        Fix #6: The client pushes STATUS_UPDATE when a send fails (timeout,
+        not connected, etc.). Clear _busy so the dialog isn't stuck.
+        """
+        self._busy = False
+
     def _on_new_version(self, event: BridgeEvent):
         """
         Feature 8: Plasticity saved a new version.
         The handler already updated bridge.status_message with a 'refresh
         available' message, so the next Timer tick will display it automatically.
-        No additional action needed here.
+        No additional action needed here — and critically, _busy is NOT cleared.
         """
         pass
 
@@ -409,6 +418,7 @@ class PlasticityDialog(gui.GeDialog):
         bridge.filename is updated by client._dispatch_parsed, and
         bridge.status_message by _on_new_file in the handler.
         The next Timer tick picks both up automatically.
+        _busy is NOT cleared — this is not a completion event.
         """
         pass
 

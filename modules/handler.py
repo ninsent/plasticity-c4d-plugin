@@ -15,7 +15,7 @@ N-GON APPROACH (refacet path only):
   'indices' array. Each consecutive run of equal values in 'faces' defines one
   polygon's vertices (which may have 3, 4, or more corners).
 
-  We build the object with fan-triangulated triangles, then use
+  I build the object with fan-triangulated triangles, then use
   MCOMMAND_MELT on polygon selections to merge the triangle groups back into
   proper C4D N-gons. Ferdinand's polygon-identity hashing approach (from the
   Maxon Developer Forum) is used to keep the melt correct when indices shift
@@ -63,15 +63,24 @@ class SceneHandler:
         self._groups = {}   # (filename, id) -> c4d.BaseObject  (null groups)
         self._roots  = {}   # filename       -> c4d.BaseObject  (root nulls)
 
-        bridge.register_callback(EventType.LIST_RESPONSE,    self._on_list_response)
-        bridge.register_callback(EventType.TRANSACTION,      self._on_transaction)
-        bridge.register_callback(EventType.REFACET_RESPONSE, self._on_refacet_response)
-        bridge.register_callback(EventType.NEW_VERSION,      self._on_new_version)
-        bridge.register_callback(EventType.NEW_FILE,         self._on_new_file)
+        # Fix #1: on_connect / on_disconnect run on the main thread via bridge
+        bridge.register_callback(EventType.CONNECTED,           self._on_connected)
+        bridge.register_callback(EventType.DISCONNECTED,        self._on_disconnected)
+        bridge.register_callback(EventType.LIST_RESPONSE,       self._on_list_response)
+        bridge.register_callback(EventType.TRANSACTION,         self._on_transaction)
+        bridge.register_callback(EventType.REFACET_RESPONSE,    self._on_refacet_response)
+        bridge.register_callback(EventType.NEW_VERSION,         self._on_new_version)
+        bridge.register_callback(EventType.NEW_FILE,            self._on_new_file)
 
     # =========================================================================
-    # Connection lifecycle
+    # Connection lifecycle (Fix #1: dispatched on the main thread)
     # =========================================================================
+
+    def _on_connected(self, event: BridgeEvent):
+        self.on_connect()
+
+    def _on_disconnected(self, event: BridgeEvent):
+        self.on_disconnect()
 
     def on_connect(self):
         self._items.clear()
@@ -769,24 +778,28 @@ class SceneHandler:
         """
         Get or create the root Null for a Plasticity filename.
         Identified by BC_PLASTICITY_ROOT marker — immune to user renaming.
+
+        Fix #4: Uses a recursive scan of the entire document hierarchy so that
+        root nulls accidentally moved inside other objects are still found,
+        preventing duplicate root creation.
         """
+        # Fast path: check cache
         if filename in self._roots:
             r = self._roots[filename]
             if r.GetDocument() == doc:
+                s = self.unit_scale
+                r[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
                 return r
 
-        obj = doc.GetFirstObject()
-        while obj:
-            bc = obj.GetDataInstance()
-            if (obj.CheckType(c4d.Onull)
-                    and bc.GetBool(BC_PLASTICITY_ROOT)
-                    and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename):
-                self._roots[filename] = obj
-                s = self.unit_scale
-                obj[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
-                return obj
-            obj = obj.GetNext()
+        # Recursive scan of the full document tree
+        found = self._find_root_recursive(doc.GetFirstObject(), doc, filename)
+        if found:
+            self._roots[filename] = found
+            s = self.unit_scale
+            found[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
+            return found
 
+        # Not found anywhere — create new root
         display_name = f"Plasticity: {filename}" if filename else "Plasticity"
         root = c4d.BaseObject(c4d.Onull)
         root.SetName(display_name)
@@ -799,6 +812,24 @@ class SceneHandler:
         doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, root)
         self._roots[filename] = root
         return root
+
+    def _find_root_recursive(self, obj, doc, filename):
+        """
+        Walk the full scene hierarchy to find a root null matching filename.
+        Returns the first match or None.
+        """
+        while obj:
+            bc = obj.GetDataInstance()
+            if (obj.CheckType(c4d.Onull)
+                    and bc.GetBool(BC_PLASTICITY_ROOT)
+                    and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename):
+                return obj
+            # Recurse into children
+            found = self._find_root_recursive(obj.GetDown(), doc, filename)
+            if found:
+                return found
+            obj = obj.GetNext()
+        return None
 
     def _delete_item(self, doc, filename, obj_id):
         key = (filename, obj_id)

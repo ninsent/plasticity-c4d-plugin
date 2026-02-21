@@ -102,10 +102,9 @@ class ThreadingBridge:
                     import traceback
                     traceback.print_exc()
 
-    def process_pending_events(self) -> int:
-        """Poll and dispatch ALL pending events. Called from main thread."""
+    def process_pending_events(self, max_events: int = 10) -> int:
         count = 0
-        while True:
+        while count < max_events:
             try:
                 event = self._queue.get_nowait()
                 self.dispatch_event(event)

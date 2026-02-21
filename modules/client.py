@@ -90,6 +90,7 @@ class PlasticityClient:
         self.status.info("Disconnecting...")
         self._running = False
 
+        # Ask the websocket to close so recv() raises ConnectionClosed
         if self._loop and self.websocket:
             try:
                 future = asyncio.run_coroutine_threadsafe(
@@ -102,9 +103,15 @@ class PlasticityClient:
             except Exception as e:
                 print(f"[Plasticity] Disconnect error: {e}")
 
-        self._cleanup_state()
-        self.bridge.push_event(BridgeEvent(event_type=EventType.DISCONNECTED))
-        self.status.info("Disconnected")
+        # Wait for the background thread to finish and push DISCONNECTED
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+        # Safety net: if the thread didn't clean up, do it from here
+        if self.bridge.connected:
+            self._cleanup_state()
+            self.bridge.push_event(BridgeEvent(event_type=EventType.DISCONNECTED))
+            self.status.info("Disconnected")
 
     def _cleanup_state(self):
         self.bridge.connected = False
@@ -128,7 +135,8 @@ class PlasticityClient:
                 pass
             self._loop = None
             self._cleanup_state()
-            self.handler.on_disconnect()
+            # Let the main thread handle on_disconnect via the bridge callback
+            self.bridge.push_event(BridgeEvent(event_type=EventType.DISCONNECTED))
 
     async def _connect_and_listen(self):
         uri = f"ws://{self.server}"
@@ -139,7 +147,8 @@ class PlasticityClient:
                 self.message_id = 0
                 self.bridge.push_event(BridgeEvent(event_type=EventType.CONNECTED))
                 self.status.info(f"Connected to {self.server}")
-                self.handler.on_connect()
+                # Fix #1: on_connect is triggered by the CONNECTED event callback
+                # on the main thread — not called directly here.
 
                 while self._running:
                     try:
@@ -249,6 +258,17 @@ class PlasticityClient:
                 future.result(timeout=timeout)
             except Exception as e:
                 print(f"[Plasticity] Send failed: {e}")
+                self.status.error(f"Send failed: {e}")
+                self.bridge.push_event(BridgeEvent(
+                    event_type=EventType.STATUS_UPDATE,
+                    error_message=str(e),
+                ))
+        else:
+            self.status.error("Cannot send — not connected")
+            self.bridge.push_event(BridgeEvent(
+                event_type=EventType.STATUS_UPDATE,
+                error_message="Cannot send — not connected",
+            ))
 
     # =========================================================================
     # Public API
