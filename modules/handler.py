@@ -54,6 +54,147 @@ BC_PLASTICITY_ROOT     = PLUGIN_ID + 5   # 1066934
 MANAGED_NORMAL_TAG_NAME = "__plasticity_normals__"
 
 
+# =============================================================================
+# Ear-clipping triangulation for concave N-gons
+# =============================================================================
+
+def _cross_2d(ax, ay, bx, by, px, py):
+    """Signed area ×2 of triangle ABP.  Positive if P is left of A→B (CCW)."""
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+
+
+def _point_in_triangle_2d(px, py, ax, ay, bx, by, cx, cy):
+    """True if point P is inside or on the boundary of triangle ABC."""
+    d1 = _cross_2d(ax, ay, bx, by, px, py)
+    d2 = _cross_2d(bx, by, cx, cy, px, py)
+    d3 = _cross_2d(cx, cy, ax, ay, px, py)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def _compute_polygon_normal(pts):
+    """
+    Newell's method — robust face normal from an ordered 3D point ring.
+    Works for non-planar and concave polygons.  Returns a unit c4d.Vector.
+    """
+    nx = ny = nz = 0.0
+    n = len(pts)
+    for i in range(n):
+        c = pts[i]
+        nxt = pts[(i + 1) % n]
+        nx += (c.y - nxt.y) * (c.z + nxt.z)
+        ny += (c.z - nxt.z) * (c.x + nxt.x)
+        nz += (c.x - nxt.x) * (c.y + nxt.y)
+    length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if length < 1e-12:
+        return c4d.Vector(0, 1, 0)
+    return c4d.Vector(nx / length, ny / length, nz / length)
+
+
+def _project_to_2d(pts, normal):
+    """
+    Flatten 3D points to 2D by dropping the axis most aligned with the
+    polygon normal.  Returns a list of (u, v) tuples.
+    """
+    ax = abs(normal.x)
+    ay = abs(normal.y)
+    az = abs(normal.z)
+    if ax >= ay and ax >= az:
+        return [(p.y, p.z) for p in pts]
+    elif ay >= az:
+        return [(p.x, p.z) for p in pts]
+    else:
+        return [(p.x, p.y) for p in pts]
+
+
+def _ear_clip(pts_2d):
+    """
+    Ear-clipping triangulation for a simple (possibly concave) polygon.
+
+    Args:
+        pts_2d: list of (x, y) coordinate tuples — the polygon perimeter
+                in order.
+
+    Returns:
+        List of (i, j, k) index triples into pts_2d.  Each triple is one
+        triangle.  Returns [] on degenerate input (< 3 vertices).
+
+    The algorithm is O(n²) worst-case, which is fine for the polygon sizes
+    Plasticity produces (typically < 200 vertices per face).
+    """
+    n = len(pts_2d)
+    if n < 3:
+        return []
+    if n == 3:
+        return [(0, 1, 2)]
+
+    # Signed area → winding direction
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts_2d[i][0] * pts_2d[j][1]
+        area -= pts_2d[j][0] * pts_2d[i][1]
+    if abs(area) < 1e-12:
+        return []                       # degenerate (zero-area) polygon
+    ccw = area > 0.0
+
+    remaining = list(range(n))          # indices into pts_2d still alive
+    triangles = []
+    max_iter  = n * n                   # safety cap
+
+    for _ in range(max_iter):
+        m = len(remaining)
+        if m < 3:
+            break
+        if m == 3:
+            triangles.append(tuple(remaining))
+            break
+
+        found_ear = False
+        for i in range(m):
+            pi = remaining[(i - 1) % m]
+            ci = remaining[i]
+            ni = remaining[(i + 1) % m]
+
+            # Convexity test: cross product of (prev→curr) × (curr→next)
+            cross = _cross_2d(
+                pts_2d[pi][0], pts_2d[pi][1],
+                pts_2d[ci][0], pts_2d[ci][1],
+                pts_2d[ni][0], pts_2d[ni][1],
+            )
+            if ccw and cross <= 0:
+                continue                # reflex vertex — skip
+            if not ccw and cross >= 0:
+                continue
+
+            # Containment test: no other remaining vertex inside this ear
+            is_ear = True
+            for j in range(m):
+                if j == (i - 1) % m or j == i or j == (i + 1) % m:
+                    continue
+                ti = remaining[j]
+                if _point_in_triangle_2d(
+                    pts_2d[ti][0], pts_2d[ti][1],
+                    pts_2d[pi][0], pts_2d[pi][1],
+                    pts_2d[ci][0], pts_2d[ci][1],
+                    pts_2d[ni][0], pts_2d[ni][1],
+                ):
+                    is_ear = False
+                    break
+
+            if is_ear:
+                triangles.append((pi, ci, ni))
+                remaining.pop(i)
+                found_ear = True
+                break
+
+        if not found_ear:
+            break                       # stuck — degenerate remainder
+
+    return triangles
+
+
 class SceneHandler:
     def __init__(self, bridge: ThreadingBridge):
         self.bridge = bridge
@@ -485,14 +626,15 @@ class SceneHandler:
         Steps:
           1. Weld duplicate vertices (Plasticity may send shared vertices as
              separate entries in N-gon mode).
-          2. Fan-triangulate each polygon from vertex 0. This is geometrically
-             correct because Plasticity guarantees convex polygon outlines.
-          3. Record which output poly indices belong to each input polygon as
+          2. Remove consecutive duplicate vertices produced by welding
+             (they would create degenerate zero-area ears).
+          3. Triangulate each polygon with ear-clipping. This is safe for
+             concave and stitched-hole polygons (e.g. annular faces).
+             Falls back to fan triangulation if ear clipping fails.
+          4. Record which output poly indices belong to each input polygon as
              poly_groups, so _create_ngon_groups() can melt them later.
 
         Notes:
-          - The visible "fan" wireframe is expected before the MELT step and
-            disappears once triangles are merged into proper N-gons.
           - NormalTag is NOT applied in N-gon mode: the melt operation changes
             the polygon topology, invalidating any pre-built normal data. The
             Phong tag handles smooth shading instead.
@@ -521,7 +663,7 @@ class SceneHandler:
         poly_groups = []   # list[list[int]]
         poly_idx    = 0    # running polygon counter
 
-        # Step 2: find polygon boundaries (runs of equal values in 'faces')
+        # Find polygon boundaries (runs of equal values in 'faces')
         poly_starts = [0]
         for i in range(1, len(faces)):
             if faces[i] != faces[i - 1]:
@@ -531,30 +673,70 @@ class SceneHandler:
         for p in range(len(poly_starts) - 1):
             start = poly_starts[p]
             end   = poly_starts[p + 1]
-            count = end - start
 
+            raw_face_vi = new_indices[start:end]     # welded vertex indices
+            raw_orig_vi = indices[start:end]          # pre-weld for normal lookup
+
+            # Step 2: remove consecutive duplicate vertices after welding.
+            # E.g. [5, 5, 7, 8, 8, 3] → [5, 7, 8, 3] with matching orig_vindices.
+            face_vindices = []
+            orig_vindices = []
+            for k in range(len(raw_face_vi)):
+                if k == 0 or raw_face_vi[k] != raw_face_vi[k - 1]:
+                    face_vindices.append(raw_face_vi[k])
+                    orig_vindices.append(raw_orig_vi[k])
+            # Also check wrap-around: if last == first, drop last
+            if len(face_vindices) > 1 and face_vindices[-1] == face_vindices[0]:
+                face_vindices.pop()
+                orig_vindices.pop()
+
+            count = len(face_vindices)
             if count < 3:
                 continue
 
-            face_vindices = new_indices[start:end]   # welded indices, in order
-            orig_vindices = indices[start:end]        # pre-weld for normal lookup
-
-            # Fan triangulation from vertex 0:
-            #   (v0,v1,v2), (v0,v2,v3), ..., (v0,vN-2,vN-1)
+            # Step 3: triangulate — ear-clipping for concave safety
             group_poly_indices = []
 
-            for t in range(count - 2):
-                ia = face_vindices[0]
-                ib = face_vindices[t + 1]
-                ic = face_vindices[t + 2]
-
-                polys.append(c4d.CPolygon(ia, ic, ib))   # reversed winding
+            if count == 3:
+                # Triangle — no triangulation needed
+                ia, ib, ic = face_vindices
+                polys.append(c4d.CPolygon(ia, ic, ib))      # reversed winding
                 normal_map.append((
-                    orig_vindices[0],     orig_vindices[t + 2],
-                    orig_vindices[t + 1], orig_vindices[t + 1],
+                    orig_vindices[0], orig_vindices[2],
+                    orig_vindices[1], orig_vindices[1],
                 ))
                 group_poly_indices.append(poly_idx)
                 poly_idx += 1
+
+            else:
+                # Gather 3D positions (already in C4D coords) for this face
+                face_pts_3d = [unique_pts[vi] for vi in face_vindices]
+
+                # Compute face normal and project to 2D for ear clipping
+                face_normal = _compute_polygon_normal(face_pts_3d)
+                pts_2d = _project_to_2d(face_pts_3d, face_normal)
+
+                ear_tris = _ear_clip(pts_2d)
+
+                # Fallback: if ear clipping produced nothing (degenerate),
+                # use fan triangulation as a last resort.
+                if not ear_tris:
+                    print(f"[Plasticity] Ear-clip failed for {count}-gon, "
+                          f"falling back to fan triangulation")
+                    ear_tris = [(0, t + 1, t + 2) for t in range(count - 2)]
+
+                for li_a, li_b, li_c in ear_tris:
+                    ia = face_vindices[li_a]
+                    ib = face_vindices[li_b]
+                    ic = face_vindices[li_c]
+
+                    polys.append(c4d.CPolygon(ia, ic, ib))   # reversed winding
+                    normal_map.append((
+                        orig_vindices[li_a], orig_vindices[li_c],
+                        orig_vindices[li_b], orig_vindices[li_b],
+                    ))
+                    group_poly_indices.append(poly_idx)
+                    poly_idx += 1
 
             # Only groups with 2+ triangles need merging
             if len(group_poly_indices) > 1:
