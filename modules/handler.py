@@ -708,6 +708,19 @@ class SceneHandler:
                 group_poly_indices.append(poly_idx)
                 poly_idx += 1
 
+            elif count == 4:
+                # Quad — native C4D quad, no triangulation or melt needed.
+                # CPolygon with 4 distinct indices is a native quad.
+                # Reversed winding: (a, d, c, b) instead of (a, b, c, d).
+                ia, ib, ic, id_ = face_vindices
+                polys.append(c4d.CPolygon(ia, id_, ic, ib))
+                normal_map.append((
+                    orig_vindices[0], orig_vindices[3],
+                    orig_vindices[2], orig_vindices[1],
+                ))
+                group_poly_indices.append(poly_idx)
+                poly_idx += 1
+
             else:
                 # Gather 3D positions (already in C4D coords) for this face
                 face_pts_3d = [unique_pts[vi] for vi in face_vindices]
