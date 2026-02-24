@@ -108,6 +108,31 @@ def _project_to_2d(pts, normal):
         return [(p.x, p.y) for p in pts]
 
 
+def _is_convex(pts_2d):
+    """
+    Quick O(n) convexity test.  Returns True if the polygon is strictly
+    convex (all cross products have the same sign).
+    """
+    n = len(pts_2d)
+    if n < 3:
+        return False
+    sign = 0
+    for i in range(n):
+        ax, ay = pts_2d[i]
+        bx, by = pts_2d[(i + 1) % n]
+        cx, cy = pts_2d[(i + 2) % n]
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if cross > 1e-12:
+            if sign < 0:
+                return False
+            sign = 1
+        elif cross < -1e-12:
+            if sign > 0:
+                return False
+            sign = -1
+    return sign != 0
+
+
 def _ear_clip(pts_2d):
     """
     Ear-clipping triangulation for a simple (possibly concave) polygon.
@@ -119,15 +144,17 @@ def _ear_clip(pts_2d):
     Returns:
         List of (i, j, k) index triples into pts_2d.  Each triple is one
         triangle.  Returns [] on degenerate input (< 3 vertices).
-
-    The algorithm is O(n²) worst-case, which is fine for the polygon sizes
-    Plasticity produces (typically < 200 vertices per face).
     """
     n = len(pts_2d)
     if n < 3:
         return []
     if n == 3:
         return [(0, 1, 2)]
+
+    # Fast-path: convex polygon → simple fan triangulation (very common
+    # for CAD-tessellated output from Plasticity).
+    if _is_convex(pts_2d):
+        return [(0, i + 1, i + 2) for i in range(n - 2)]
 
     # Signed area → winding direction
     area = 0.0
@@ -139,9 +166,24 @@ def _ear_clip(pts_2d):
         return []                       # degenerate (zero-area) polygon
     ccw = area > 0.0
 
+    # Pre-extract coordinates for fast access (avoid repeated tuple indexing)
+    xs = [p[0] for p in pts_2d]
+    ys = [p[1] for p in pts_2d]
+
     remaining = list(range(n))          # indices into pts_2d still alive
     triangles = []
-    max_iter  = n * n                   # safety cap
+
+    # Build initial reflex vertex set (only reflex vertices can block ears)
+    reflex = set()
+    for i in range(n):
+        pi = remaining[(i - 1) % n]
+        ci = remaining[i]
+        ni = remaining[(i + 1) % n]
+        cross = _cross_2d(xs[pi], ys[pi], xs[ci], ys[ci], xs[ni], ys[ni])
+        if (ccw and cross <= 0) or (not ccw and cross >= 0):
+            reflex.add(ci)
+
+    max_iter = n * n                    # safety cap
 
     for _ in range(max_iter):
         m = len(remaining)
@@ -153,32 +195,25 @@ def _ear_clip(pts_2d):
 
         found_ear = False
         for i in range(m):
-            pi = remaining[(i - 1) % m]
             ci = remaining[i]
+            if ci in reflex:
+                continue                # reflex vertex can't be an ear tip
+
+            pi = remaining[(i - 1) % m]
             ni = remaining[(i + 1) % m]
 
-            # Convexity test: cross product of (prev→curr) × (curr→next)
-            cross = _cross_2d(
-                pts_2d[pi][0], pts_2d[pi][1],
-                pts_2d[ci][0], pts_2d[ci][1],
-                pts_2d[ni][0], pts_2d[ni][1],
-            )
-            if ccw and cross <= 0:
-                continue                # reflex vertex — skip
-            if not ccw and cross >= 0:
-                continue
+            pix, piy = xs[pi], ys[pi]
+            cix, ciy = xs[ci], ys[ci]
+            nix, niy = xs[ni], ys[ni]
 
-            # Containment test: no other remaining vertex inside this ear
+            # Containment test: only check reflex vertices (they are the
+            # only ones that can be inside the ear triangle).
             is_ear = True
-            for j in range(m):
-                if j == (i - 1) % m or j == i or j == (i + 1) % m:
+            for ri in reflex:
+                if ri == pi or ri == ci or ri == ni:
                     continue
-                ti = remaining[j]
                 if _point_in_triangle_2d(
-                    pts_2d[ti][0], pts_2d[ti][1],
-                    pts_2d[pi][0], pts_2d[pi][1],
-                    pts_2d[ci][0], pts_2d[ci][1],
-                    pts_2d[ni][0], pts_2d[ni][1],
+                    xs[ri], ys[ri], pix, piy, cix, ciy, nix, niy,
                 ):
                     is_ear = False
                     break
@@ -186,6 +221,27 @@ def _ear_clip(pts_2d):
             if is_ear:
                 triangles.append((pi, ci, ni))
                 remaining.pop(i)
+                reflex.discard(ci)
+
+                # Neighbours may have changed convexity — update reflex set
+                m2 = len(remaining)
+                if m2 >= 3:
+                    for check_i in (
+                        remaining.index(pi) if pi in remaining else -1,
+                        remaining.index(ni) if ni in remaining else -1,
+                    ):
+                        if check_i < 0:
+                            continue
+                        p2 = remaining[(check_i - 1) % m2]
+                        c2 = remaining[check_i]
+                        n2 = remaining[(check_i + 1) % m2]
+                        cross = _cross_2d(
+                            xs[p2], ys[p2], xs[c2], ys[c2], xs[n2], ys[n2])
+                        if (ccw and cross <= 0) or (not ccw and cross >= 0):
+                            reflex.add(c2)
+                        else:
+                            reflex.discard(c2)
+
                 found_ear = True
                 break
 
@@ -503,6 +559,7 @@ class SceneHandler:
 
                     phong = new_obj.MakeTag(c4d.Tphong)
                     phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
+                    phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
                     new_obj.Message(c4d.MSG_UPDATE)
 
                     self._copy_plasticity_meta(new_obj, obj_id, filename, groups, face_ids)
@@ -803,6 +860,7 @@ class SceneHandler:
         if not phong:
             phong = obj.MakeTag(c4d.Tphong)
             phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
+        phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
 
         obj.Message(c4d.MSG_UPDATE)
 
