@@ -971,25 +971,91 @@ class SceneHandler:
 
         # Build the identity index from the initial mesh state (before any melts).
         # Maps original_poly_index -> (a, b, c, d) vertex tuple.
+        all_polys = obj.GetAllPolygons()
         polygon_identity = {
             i: (cp.a, cp.b, cp.c, cp.d)
-            for i, cp in enumerate(obj.GetAllPolygons())
+            for i, cp in enumerate(all_polys)
         }
 
+        # ── Step 1: Collect edges per group ──────────────────────────────────
+        # Each polygon is a triangle (d == c) from ear-clip triangulation.
+        # Edges are unordered vertex pairs stored as (min, max) for fast lookup.
+        group_edges = []
         for group in groups_to_melt:
-            # Rebuild the inverted index for the CURRENT mesh state.
-            # Must be done on every iteration because each melt changes the mesh.
+            edges = set()
+            for pid in group:
+                identity = polygon_identity.get(pid)
+                if identity is None:
+                    continue
+                a, b, c, d = identity
+                if c == d:                               # triangle
+                    verts = (a, b, c)
+                else:                                    # quad (shouldn't happen
+                    verts = (a, b, c, d)                 # here, but handle safely)
+                n = len(verts)
+                for i in range(n):
+                    v1, v2 = verts[i], verts[(i + 1) % n]
+                    edges.add((v1, v2) if v1 < v2 else (v2, v1))
+            group_edges.append(edges)
+
+        # ── Step 2: Build adjacency graph between groups ─────────────────────
+        # Two groups are adjacent if any of their triangles share an edge.
+        # An edge→group inverted index makes this O(total_edges) instead of
+        # O(n_groups²).
+        n_groups = len(groups_to_melt)
+        adjacent = [set() for _ in range(n_groups)]
+
+        edge_to_group = {}       # edge -> first group index that owns it
+        for gi, edges in enumerate(group_edges):
+            for edge in edges:
+                prev_gi = edge_to_group.get(edge)
+                if prev_gi is not None and prev_gi != gi:
+                    adjacent[gi].add(prev_gi)
+                    adjacent[prev_gi].add(gi)
+                else:
+                    edge_to_group[edge] = gi
+
+        # ── Step 3: Greedy graph colouring → non-adjacent batches ────────────
+        # Each "colour" becomes one MCOMMAND_MELT pass.  For typical Plasticity
+        # output most faces are isolated, so almost everything lands in colour 0.
+        colors = [-1] * n_groups
+        batches = []             # list[list[int]]  (group indices per batch)
+
+        for gi in range(n_groups):
+            used = set()
+            for adj_gi in adjacent[gi]:
+                if colors[adj_gi] >= 0:
+                    used.add(colors[adj_gi])
+
+            color = 0
+            while color in used:
+                color += 1
+
+            colors[gi] = color
+            while len(batches) <= color:
+                batches.append([])
+            batches[color].append(gi)
+
+        # ── Step 4: Melt each batch ──────────────────────────────────────────
+        for batch in batches:
+            if not batch:
+                continue
+
+            # Rebuild inverted index for the CURRENT mesh state.
+            # Must be rebuilt before each batch because the prior batch's melt
+            # changed polygon indices.
             inverted = {
                 (cp.a, cp.b, cp.c, cp.d): i
                 for i, cp in enumerate(obj.GetAllPolygons())
             }
 
-            # Translate original poly indices to current live indices.
+            # Translate all original poly indices in this batch to live indices.
             real_indices = []
-            for orig_pid in group:
-                id_key = polygon_identity.get(orig_pid)
-                if id_key is not None and id_key in inverted:
-                    real_indices.append(inverted[id_key])
+            for gi in batch:
+                for orig_pid in groups_to_melt[gi]:
+                    id_key = polygon_identity.get(orig_pid)
+                    if id_key is not None and id_key in inverted:
+                        real_indices.append(inverted[id_key])
 
             if len(real_indices) < 2:
                 continue
@@ -1007,7 +1073,9 @@ class SceneHandler:
                 doc=doc,
             )
             if not result:
-                print(f"[Plasticity] Warning: MCOMMAND_MELT failed for group {group}")
+                grp_count = len(batch)
+                print(f"[Plasticity] Warning: MCOMMAND_MELT failed for "
+                      f"batch of {grp_count} groups")
 
     # =========================================================================
     # Metadata helpers
