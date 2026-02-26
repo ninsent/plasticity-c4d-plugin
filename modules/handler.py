@@ -53,6 +53,12 @@ BC_PLASTICITY_ROOT     = PLUGIN_ID + 5   # 1066934
 
 MANAGED_NORMAL_TAG_NAME = "__plasticity_normals__"
 
+# Plasticity sends vertex positions in metres; C4D's internal unit is
+# centimetres.  Multiply every incoming coordinate by this factor so the
+# geometry appears at the correct size *before* the user's unit_scale is
+# applied on the root null.
+_IMPORT_SCALE = 100.0
+
 
 # =============================================================================
 # Ear-clipping triangulation for concave N-gons
@@ -653,11 +659,12 @@ class SceneHandler:
         tri_count  = len(indices)  // 3
 
         points = []
+        s = _IMPORT_SCALE
         for i in range(vert_count):
             points.append(c4d.Vector(
-                vertices[i * 3],
-                vertices[i * 3 + 2],   # Plasticity Z → C4D Y
-                vertices[i * 3 + 1],   # Plasticity Y → C4D Z
+                vertices[i * 3]     * s,
+                vertices[i * 3 + 2] * s,   # Plasticity Z → C4D Y
+                vertices[i * 3 + 1] * s,   # Plasticity Y → C4D Z
             ))
 
         polys      = []
@@ -702,6 +709,7 @@ class SceneHandler:
         vert_map   = {}
         old_to_new = [0] * vert_count
         unique_pts = []
+        s = _IMPORT_SCALE
 
         for i in range(vert_count):
             px = vertices[i * 3]
@@ -710,7 +718,7 @@ class SceneHandler:
             key = (round(px, 7), round(py, 7), round(pz, 7))
             if key not in vert_map:
                 vert_map[key] = len(unique_pts)
-                unique_pts.append(c4d.Vector(px, pz, py))   # coord swap
+                unique_pts.append(c4d.Vector(px * s, pz * s, py * s))   # coord swap + scale
             old_to_new[i] = vert_map[key]
 
         new_indices = [old_to_new[idx] for idx in indices]
