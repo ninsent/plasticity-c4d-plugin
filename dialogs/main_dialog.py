@@ -66,7 +66,8 @@ class IDS:
     BTN_REFACET          = 1700
 
     # Utilities tab
-    LBL_UTILITIES_SOON   = 1900
+    BTN_STORE_FACES      = 1901
+    BTN_STORE_EDGES      = 1902
 
 
 def _add_section_header(dlg, gadget_id, title):
@@ -329,12 +330,17 @@ class PlasticityDialog(gui.GeDialog):
 
                 _add_section_header(self, IDS.HDR_UTILITIES, "Utilities")
 
-                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 1, 0):
-                    self.GroupBorderSpace(4, 12, 4, 12)
-                    self.AddStaticText(
-                        IDS.LBL_UTILITIES_SOON, c4d.BFH_CENTER,
-                        name="Select Face / Mark Edges / Paint Faces"
-                             " — coming soon")
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 4, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
+                                       name="Store")
+                    if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                        self.AddButton(IDS.BTN_STORE_FACES, c4d.BFH_SCALEFIT,
+                                       name="All Plasticity Faces")
+                        self.AddButton(IDS.BTN_STORE_EDGES, c4d.BFH_SCALEFIT,
+                                       name="All Plasticity Edges")
+                    self.GroupEnd()
                 self.GroupEnd()
 
             self.GroupEnd()  # GRP_TAB_UTILITIES
@@ -487,6 +493,13 @@ class PlasticityDialog(gui.GeDialog):
             self._busy = True
             self._do_refacet()
 
+        # ── Utilities ────────────────────────────────────────────────────
+        elif id == IDS.BTN_STORE_FACES:
+            self._do_store_faces()
+
+        elif id == IDS.BTN_STORE_EDGES:
+            self._do_store_edges()
+
         return True
 
     # =========================================================================
@@ -502,6 +515,8 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.CHK_LIVELINK,   connected)
         self.Enable(IDS.BTN_REFACET,    connected and not self._busy)
         self.Enable(IDS.EDT_SERVER,     not connected)
+        self.Enable(IDS.BTN_STORE_FACES, not self._busy)
+        self.Enable(IDS.BTN_STORE_EDGES, not self._busy)
 
         status = self.bridge.status_message
         self.SetString(IDS.LBL_STATUS,   f"Status: {status}")
@@ -595,6 +610,34 @@ class PlasticityDialog(gui.GeDialog):
                 curve_chord_max       = curve_chord_max,
                 shape                 = FacetShapeType.CUT,
             )
+
+    # =========================================================================
+    # Store Plasticity Faces
+    # =========================================================================
+
+    def _do_store_faces(self):
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return
+        affected = self.handler.apply_face_selection_tags(doc)
+        if not affected:
+            gui.MessageDialog(
+                "No Plasticity objects selected.\n"
+                "Select one or more Plasticity mesh objects first.")
+
+    # =========================================================================
+    # Store Plasticity Edges
+    # =========================================================================
+
+    def _do_store_edges(self):
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return
+        affected = self.handler.apply_edge_selection_tags(doc)
+        if not affected:
+            gui.MessageDialog(
+                "No Plasticity objects selected.\n"
+                "Select one or more Plasticity mesh objects first.")
 
     # =========================================================================
     # Layout restore and cleanup

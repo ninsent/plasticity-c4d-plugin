@@ -65,7 +65,9 @@ BC_PLASTICITY_FACE_IDS = PLUGIN_ID + 4   # 1066933
 BC_PLASTICITY_ROOT     = PLUGIN_ID + 5   # 1066934
 BC_PLASTICITY_POLY_FACE_MAP = PLUGIN_ID + 6   # 1066935
 
-MANAGED_NORMAL_TAG_NAME = "__plasticity_normals__"
+MANAGED_NORMAL_TAG_NAME  = "__plasticity_normals__"
+MANAGED_FACE_SEL_PREFIX  = "Plasticity Face "
+MANAGED_EDGES_TAG_NAME   = "__plasticity_edges__"
 
 # Plasticity sends vertex positions in metres; C4D's internal unit is
 # centimetres.  Multiply every incoming coordinate by this factor so the
@@ -1007,6 +1009,12 @@ class SceneHandler:
             next_tag = tag.GetNext()
             if tag.CheckType(c4d.Tnormal) and tag.GetName() == MANAGED_NORMAL_TAG_NAME:
                 tag.Remove()
+            elif (tag.CheckType(c4d.Tpolygonselection)
+                  and tag.GetName().startswith(MANAGED_FACE_SEL_PREFIX)):
+                tag.Remove()
+            elif (tag.CheckType(c4d.Tedgeselection)
+                  and tag.GetName() == MANAGED_EDGES_TAG_NAME):
+                tag.Remove()
             tag = next_tag
 
     # =========================================================================
@@ -1563,3 +1571,206 @@ class SceneHandler:
         for obj in selection:
             collect(obj)
         return ids
+    # =========================================================================
+    # Utilities
+    # =========================================================================
+
+    def apply_face_selection_tags(self, doc):
+        """Create one PolygonSelectionTag per Plasticity face group on selected objects.
+
+        Tags are named "<MANAGED_FACE_SEL_PREFIX><group_index>" so they are
+        automatically removed by _strip_managed_tags on the next geometry update
+        (refresh, live-link transaction, or refacet).  Each tag selects exactly
+        the polygons that belong to the corresponding Plasticity CAD face.
+        """
+        if not doc:
+            return False
+
+        selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+        affected  = 0
+
+        doc.StartUndo()
+        try:
+            for obj in selection:
+                if self._apply_face_sel_tags_to_obj(doc, obj):
+                    affected += 1
+        finally:
+            doc.EndUndo()
+
+        c4d.EventAdd()
+        return affected > 0
+
+    def _apply_face_sel_tags_to_obj(self, doc, obj):
+        """Internal: add face-selection tags to a single object. Returns True on success."""
+        if not obj.CheckType(c4d.Opolygon):
+            return False
+
+        bc  = obj.GetDataInstance()
+        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
+        if pid == 0:
+            return False
+
+        pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+        face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
+        if not pfm_str or not face_ids_str:
+            return False
+
+        poly_face_map = json.loads(pfm_str)
+        face_ids      = json.loads(face_ids_str)
+
+        poly_count = obj.GetPolygonCount()
+        if poly_count == 0 or not poly_face_map or not face_ids:
+            return False
+
+        # Strip any stale face-selection tags before creating new ones.
+        # (This is also done by _strip_managed_tags on mesh update, but we call
+        # it here too so that re-running the utility on the same object is clean.)
+        tag = obj.GetFirstTag()
+        while tag:
+            next_t = tag.GetNext()
+            if (tag.CheckType(c4d.Tpolygonselection)
+                    and tag.GetName().startswith(MANAGED_FACE_SEL_PREFIX)):
+                doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, tag)
+                tag.Remove()
+            tag = next_t
+
+        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+
+        # One SelectionTag per face group.
+        n_groups  = len(face_ids)
+        tag_sels  = []   # list of BaseSelect, indexed by group_idx
+        for group_idx in range(n_groups):
+            sel_tag = obj.MakeTag(c4d.Tpolygonselection)
+            sel_tag.SetName(f"{MANAGED_FACE_SEL_PREFIX}{group_idx}")
+            doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, sel_tag)
+            tag_sels.append(sel_tag.GetBaseSelect())
+
+        # Assign each polygon to its group's selection.
+        map_len = min(len(poly_face_map), poly_count)
+        for poly_idx in range(map_len):
+            group_idx = poly_face_map[poly_idx]
+            if 0 <= group_idx < n_groups:
+                tag_sels[group_idx].Select(poly_idx)
+
+        obj.Message(c4d.MSG_UPDATE)
+        return True
+
+    def apply_edge_selection_tags(self, doc):
+        """Create a single EdgeSelectionTag on selected objects containing all
+        Plasticity boundary edges — edges between different face groups or on
+        the mesh boundary.  The tag is named MANAGED_EDGES_TAG_NAME and is
+        automatically stripped by _strip_managed_tags on the next geometry
+        update (refresh, live-link transaction, or refacet).
+
+        Edge addressing in C4D: poly_idx * 4 + slot, where slot 0..3 maps to
+        edges a→b, b→c, c→d, d→a respectively.  For triangles (d == c) slot 2
+        is degenerate and is skipped.
+        """
+        if not doc:
+            return False
+
+        selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+        affected  = 0
+
+        doc.StartUndo()
+        try:
+            for obj in selection:
+                if self._apply_edge_sel_tags_to_obj(doc, obj):
+                    affected += 1
+        finally:
+            doc.EndUndo()
+
+        c4d.EventAdd()
+        return affected > 0
+
+    def _apply_edge_sel_tags_to_obj(self, doc, obj):
+        """Internal: add a single edge-selection tag to a single object. Returns True on success.
+
+        Selects every edge that is either:
+          - shared between two polygons belonging to different Plasticity face groups
+            (a group-boundary edge), or
+          - adjacent to only one polygon at all (a mesh-boundary edge).
+
+        C4D edge addressing: poly_idx * 4 + slot, where slot 0..3 maps to
+        edges a→b, b→c, c→d, d→a.  For triangles (d == c) slot 2 is
+        degenerate and is skipped.
+        """
+        if not obj.CheckType(c4d.Opolygon):
+            return False
+
+        bc  = obj.GetDataInstance()
+        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
+        if pid == 0:
+            return False
+
+        pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+        face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
+        if not pfm_str or not face_ids_str:
+            return False
+
+        poly_face_map = json.loads(pfm_str)
+        face_ids      = json.loads(face_ids_str)
+
+        poly_count = obj.GetPolygonCount()
+        if poly_count == 0 or not poly_face_map or not face_ids:
+            return False
+
+        # Strip any stale edges tag before creating a new one.
+        tag = obj.GetFirstTag()
+        while tag:
+            next_t = tag.GetNext()
+            if (tag.CheckType(c4d.Tedgeselection)
+                    and tag.GetName() == MANAGED_EDGES_TAG_NAME):
+                doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, tag)
+                tag.Remove()
+            tag = next_t
+
+        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+
+        # Build a global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
+        # across every polygon on the mesh.
+        edge_map = {}
+        map_len  = min(len(poly_face_map), poly_count)
+
+        for poly_idx in range(map_len):
+            group_idx = poly_face_map[poly_idx]
+            cp        = obj.GetPolygon(poly_idx)
+            is_tri    = (cp.c == cp.d)
+
+            edge_slots = [
+                (0, cp.a, cp.b),
+                (1, cp.b, cp.c),
+                (3, cp.d, cp.a),
+            ]
+            if not is_tri:
+                edge_slots.append((2, cp.c, cp.d))
+
+            for slot, v1, v2 in edge_slots:
+                key = (min(v1, v2), max(v1, v2))
+                if key not in edge_map:
+                    edge_map[key] = []
+                edge_map[key].append((poly_idx, slot, group_idx))
+
+        # Select edges that are on a group boundary or the mesh boundary.
+        sel_tag = obj.MakeTag(c4d.Tedgeselection)
+        sel_tag.SetName(MANAGED_EDGES_TAG_NAME)
+        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, sel_tag)
+        bs = sel_tag.GetBaseSelect()
+
+        for occurrences in edge_map.values():
+            if len(occurrences) == 1:
+                # Mesh boundary — only one polygon owns this edge.
+                poly_idx, slot, _ = occurrences[0]
+                bs.Select(poly_idx * 4 + slot)
+            elif len(occurrences) == 2:
+                # Shared edge — select it only if the two polygons belong to
+                # different Plasticity face groups.
+                _, _, g0 = occurrences[0]
+                _, _, g1 = occurrences[1]
+                if g0 != g1:
+                    poly_idx, slot, _ = occurrences[0]
+                    bs.Select(poly_idx * 4 + slot)
+            # Edges shared by 3+ polygons (non-manifold) are ignored.
+
+        obj.Message(c4d.MSG_UPDATE)
+        return True
