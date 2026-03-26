@@ -21,8 +21,20 @@ N-GON APPROACH (refacet path only):
   Maxon Developer Forum) is used to keep the melt correct when indices shift
   after each successive melt operation.
 
-  After melting, the NormalTag would have stale polygon indices, so in N-gon
-  mode we skip it and rely on the Phong tag for smooth shading.
+NORMALS IN N-GON MODE:
+  The melt operation changes the polygon topology, invalidating any pre-built
+  NormalTag.  The solution is to pre-compute a corner_normals dict keyed by
+  (welded_vertex_index, group_index) during triangulation — before the melt.
+  After melt, each post-melt polygon is mapped back to its Plasticity group
+  via vertex-identity tracking, then the NormalTag is rebuilt from the dict.
+  This gives identical normal quality in both tri and N-gon modes.
+
+POLY-FACE MAP (BC_PLASTICITY_POLY_FACE_MAP):
+  A JSON list stored on each mesh object, one entry per C4D polygon, giving
+  the Plasticity group index (0-based into face_ids) that the polygon belongs
+  to.  Computed at import time for tri mode, or after melt for N-gon mode.
+  This is the single source of truth for all downstream consumers (utilities,
+  normal reconstruction, etc.) — no loop-range arithmetic required.
 
 COORDINATE SYSTEM: Plasticity is Z-up, C4D is Y-up.
   C4D X = Plasticity X,  C4D Y = Plasticity Z,  C4D Z = Plasticity Y.
@@ -37,6 +49,7 @@ UNIT SCALE: Lives on the root null's scale transform, not baked into vertices.
 
 import c4d
 import array
+import bisect
 import json
 from typing import Dict, List, Optional, Any, Set, Tuple
 
@@ -50,6 +63,7 @@ BC_PLASTICITY_FILENAME = PLUGIN_ID + 2   # 1066931
 BC_PLASTICITY_GROUPS   = PLUGIN_ID + 3   # 1066932
 BC_PLASTICITY_FACE_IDS = PLUGIN_ID + 4   # 1066933
 BC_PLASTICITY_ROOT     = PLUGIN_ID + 5   # 1066934
+BC_PLASTICITY_POLY_FACE_MAP = PLUGIN_ID + 6   # 1066935
 
 MANAGED_NORMAL_TAG_NAME = "__plasticity_normals__"
 
@@ -348,8 +362,12 @@ class SceneHandler:
             doc.EndUndo()
 
         # MELT must run outside the undo block — SMC manages its own undo entries.
-        for obj, poly_groups in deferred_ngons:
-            self._create_ngon_groups(obj, poly_groups)
+        # Release each entry after processing to free corner_normals memory.
+        for i in range(len(deferred_ngons)):
+            obj, poly_groups, corner_normals, poly_face_val = deferred_ngons[i]
+            deferred_ngons[i] = None
+            self._create_ngon_groups(obj, poly_groups, corner_normals,
+                                     poly_face_val)
 
         c4d.EventAdd()
 
@@ -380,8 +398,11 @@ class SceneHandler:
             doc.EndUndo()
 
         # MELT must run outside the undo block — SMC manages its own undo entries.
-        for obj, poly_groups in deferred_ngons:
-            self._create_ngon_groups(obj, poly_groups)
+        for i in range(len(deferred_ngons)):
+            obj, poly_groups, corner_normals, poly_face_val = deferred_ngons[i]
+            deferred_ngons[i] = None
+            self._create_ngon_groups(obj, poly_groups, corner_normals,
+                                     poly_face_val)
 
         c4d.EventAdd()
 
@@ -402,7 +423,7 @@ class SceneHandler:
         if not doc:
             return
 
-        deferred_ngons = []   # [(obj, poly_groups)] — melted OUTSIDE undo block
+        deferred_ngons = []   # [(obj, pg, cn, pfv)] — melted OUTSIDE undo block
 
         doc.StartUndo()
         try:
@@ -426,20 +447,24 @@ class SceneHandler:
                     continue
 
                 doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-                poly_groups = self._update_object_geometry(
-                    obj, verts, indices, faces, normals)
-                self._copy_plasticity_meta(obj, pid, filename, groups, face_ids)
+                pg, cn, pfv, pfm = self._update_object_geometry(
+                    obj, verts, indices, faces, normals, groups)
+                self._copy_plasticity_meta(
+                    obj, pid, filename, groups, face_ids,
+                    poly_face_map=pfm if not pg else None)
 
-                if poly_groups:
-                    deferred_ngons.append((obj, poly_groups))
+                if pg:
+                    deferred_ngons.append((obj, pg, cn, pfv))
 
         finally:
             doc.EndUndo()
 
         # SendModelingCommand(MCOMMAND_MELT) manages its own undo entries and
         # fails silently when called inside StartUndo/EndUndo — run it after.
-        for obj, poly_groups in deferred_ngons:
-            self._create_ngon_groups(obj, poly_groups)
+        for i in range(len(deferred_ngons)):
+            obj, pg, cn, pfv = deferred_ngons[i]
+            deferred_ngons[i] = None
+            self._create_ngon_groups(obj, pg, cn, pfv)
 
         c4d.EventAdd()
 
@@ -499,7 +524,7 @@ class SceneHandler:
         N-gon melts are deferred until after all insertions in Pass 1 so that
         the objects are guaranteed to be in the document before SMC runs.
         """
-        deferred_ngons = []   # list of (obj, poly_groups)
+        deferred_ngons = []   # list of (obj, poly_groups, corner_normals, poly_face_val)
 
         # ── Pass 1: Geometry ──────────────────────────────────────────────────
         for item in objects:
@@ -543,15 +568,18 @@ class SceneHandler:
                     doc.AddUndo(c4d.UNDOTYPE_CHANGE, existing)
                     existing.SetName(name)
                     # faces=[] means tri mode; standard objects carry no poly-membership
-                    pg = self._update_object_geometry(existing, verts, indices, [], normals)
-                    self._copy_plasticity_meta(existing, obj_id, filename, groups, face_ids)
+                    pg, cn, pfv, pfm = self._update_object_geometry(
+                        existing, verts, indices, [], normals, groups)
+                    self._copy_plasticity_meta(
+                        existing, obj_id, filename, groups, face_ids,
+                        poly_face_map=pfm if not pg else None)
                     if pg:
-                        deferred_ngons.append((existing, pg))
+                        deferred_ngons.append((existing, pg, cn, pfv))
 
                 else:
                     # NEW OBJECT (standard path = tri mode, poly_groups = [])
-                    points, polys, normal_map, poly_groups = \
-                        self._compute_geometry(verts, indices, [], normals)
+                    points, polys, normal_map, poly_groups, cn, pfv = \
+                        self._compute_geometry(verts, indices, [], normals, groups)
 
                     if not polys:
                         continue
@@ -562,19 +590,24 @@ class SceneHandler:
 
                     if not poly_groups and normals and normal_map:
                         self._apply_normals(new_obj, normals, normal_map)
+                        pfm = self._compute_tri_face_map(len(polys), groups)
+                    else:
+                        pfm = None   # ngon: _create_ngon_groups will set it
 
                     phong = new_obj.MakeTag(c4d.Tphong)
                     phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
                     phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
                     new_obj.Message(c4d.MSG_UPDATE)
 
-                    self._copy_plasticity_meta(new_obj, obj_id, filename, groups, face_ids)
+                    self._copy_plasticity_meta(
+                        new_obj, obj_id, filename, groups, face_ids,
+                        poly_face_map=pfm)
                     self._insert_last_child(doc, new_obj, root)
                     doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, new_obj)
                     self._items[key] = new_obj
 
                     if poly_groups:
-                        deferred_ngons.append((new_obj, poly_groups))
+                        deferred_ngons.append((new_obj, poly_groups, cn, pfv))
 
         # Deferred N-gon merges collected during Pass 1 — returned to caller so
         # they can be run OUTSIDE the active StartUndo/EndUndo block.
@@ -629,23 +662,33 @@ class SceneHandler:
     # Geometry computation
     # =========================================================================
 
-    def _compute_geometry(self, vertices, indices, faces, normals):
+    def _compute_geometry(self, vertices, indices, faces, normals, groups):
         """
         Route to the correct geometry builder based on whether N-gon
         polygon-membership data is present.
 
         Returns:
-            (points, polys, normal_map, poly_groups)
+            (points, polys, normal_map, poly_groups, corner_normals, poly_face_val)
+
             poly_groups = [] means tri mode (no merging needed).
             poly_groups = [[...], [...]] means N-gon mode: groups of triangle
             poly indices that should be merged by _create_ngon_groups().
+
+            corner_normals: dict of {(welded_vert_idx, group_idx): (nx, ny, nz)}
+                Pre-computed normals for post-melt NormalTag reconstruction.
+                Stored as float tuples (not c4d.Vector) for memory efficiency.
+                Empty in tri mode (normal_map is used instead).
+
+            poly_face_val: list of group indices, one per pre-melt polygon.
+                Used by _create_ngon_groups to rebuild the face map after melt.
+                Empty in tri mode.
         """
         if faces:
-            return self._compute_ngon_geometry(vertices, indices, faces, normals)
+            return self._compute_ngon_geometry(vertices, indices, faces, normals, groups)
         else:
-            return self._compute_tri_geometry(vertices, indices, normals)
+            return self._compute_tri_geometry(vertices, indices, normals, groups)
 
-    def _compute_tri_geometry(self, vertices, indices, normals):
+    def _compute_tri_geometry(self, vertices, indices, normals, groups):
         """
         Build pure-triangle geometry for standard ADD/UPDATE objects.
 
@@ -676,9 +719,12 @@ class SceneHandler:
             polys.append(c4d.CPolygon(a, c_, b))
             normal_map.append((a, c_, b, b))
 
-        return points, polys, normal_map, []
+        # corner_normals and poly_face_val are empty for tri mode —
+        # tri mode uses normal_map + _apply_normals, and poly_face_map
+        # is computed separately via _compute_tri_face_map.
+        return points, polys, normal_map, [], {}, []
 
-    def _compute_ngon_geometry(self, vertices, indices, faces, normals):
+    def _compute_ngon_geometry(self, vertices, indices, faces, normals, groups):
         """
         Build geometry for N-gon refacet data.
 
@@ -697,13 +743,42 @@ class SceneHandler:
              Falls back to fan triangulation if ear clipping fails.
           4. Record which output poly indices belong to each input polygon as
              poly_groups, so _create_ngon_groups() can melt them later.
+          5. Build corner_normals dict keyed by (welded_vert_idx, group_idx)
+             for post-melt NormalTag reconstruction.
+          6. Build poly_face_val list mapping each pre-melt polygon to its
+             Plasticity group index for post-melt face-map reconstruction.
 
-        Notes:
-          - NormalTag is NOT applied in N-gon mode: the melt operation changes
-            the polygon topology, invalidating any pre-built normal data. The
-            Phong tag handles smooth shading instead.
+        The group_idx used in corner_normals / poly_face_val is the 0-based
+        index into the Plasticity 'groups' array (i.e. which Plasticity face
+        the polygon belongs to).  We derive it from the faces[] membership
+        value by building a face_val→group_idx mapping from the groups array.
         """
         vert_count = len(vertices) // 3
+
+        # ── Build face-value → group-index mapping ───────────────────────
+        # The 'groups' array is [loop_start, loop_count, loop_start, ...].
+        # The 'faces' membership values are Plasticity face IDs.
+        # We need to map each face-value back to its 0-based group index.
+        #
+        # Strategy: For each polygon boundary (runs of equal values in faces[]),
+        # its first loop position falls within exactly one group's
+        # [loop_start, loop_start+loop_count) range.  That gives us the
+        # group index for every face-value we encounter.
+        #
+        # We pre-build a sorted list of (loop_start, group_idx) for
+        # binary-search lookup.
+        group_starts = []   # [(loop_start, group_idx), ...]
+        for gi in range(len(groups) // 2):
+            group_starts.append((groups[gi * 2], gi))
+        group_starts.sort(key=lambda x: x[0])
+        gs_keys = [gs[0] for gs in group_starts]   # for bisect
+
+        def _face_val_to_group_idx(loop_pos):
+            """Map a loop position to its 0-based group index."""
+            idx = bisect.bisect_right(gs_keys, loop_pos) - 1
+            if idx >= 0:
+                return group_starts[idx][1]
+            return 0   # fallback
 
         # Step 1: weld duplicate vertices
         vert_map   = {}
@@ -723,10 +798,33 @@ class SceneHandler:
 
         new_indices = [old_to_new[idx] for idx in indices]
 
-        polys       = []
-        normal_map  = []
-        poly_groups = []   # list[list[int]]
-        poly_idx    = 0    # running polygon counter
+        polys         = []
+        normal_map    = []
+        poly_groups   = []   # list[list[int]]
+        poly_face_val = []   # group_idx per pre-melt polygon
+        poly_idx      = 0    # running polygon counter
+
+        # ── corner_normals: {(welded_vert_idx, group_idx): (nx, ny, nz)} ────
+        # Populated from every loop position. Resolves split normals at face
+        # boundaries because the same welded vertex gets separate entries
+        # keyed by which group is asking.
+        #
+        # Stored as lightweight float tuples (not c4d.Vector) to avoid the
+        # heavy C++ wrapper overhead when accumulating data for 100+ objects
+        # in deferred_ngons. Converted to c4d.Vector only at NormalTag write.
+        corner_normals = {}
+        has_normals    = len(normals) >= 3
+
+        def _ntuple(orig_vi):
+            """Coord-swapped normal as (x, y, z) float tuple."""
+            base = orig_vi * 3
+            if base + 2 < len(normals):
+                return (
+                    normals[base],
+                    normals[base + 2],   # Plasticity Nz → C4D Ny
+                    normals[base + 1],   # Plasticity Ny → C4D Nz
+                )
+            return (0.0, 1.0, 0.0)
 
         # Find polygon boundaries (runs of equal values in 'faces')
         poly_starts = [0]
@@ -741,6 +839,18 @@ class SceneHandler:
 
             raw_face_vi = new_indices[start:end]     # welded vertex indices
             raw_orig_vi = indices[start:end]          # pre-weld for normal lookup
+
+            # Determine the group index for this polygon
+            group_idx = _face_val_to_group_idx(start)
+
+            # Step 5: populate corner_normals for every loop in this polygon
+            # (before dedup, so we don't lose any split-normal data)
+            if has_normals:
+                for k in range(len(raw_face_vi)):
+                    welded_vi = raw_face_vi[k]
+                    cn_key = (welded_vi, group_idx)
+                    if cn_key not in corner_normals:
+                        corner_normals[cn_key] = _ntuple(raw_orig_vi[k])
 
             # Step 2: remove consecutive duplicate vertices after welding.
             # E.g. [5, 5, 7, 8, 8, 3] → [5, 7, 8, 3] with matching orig_vindices.
@@ -771,6 +881,7 @@ class SceneHandler:
                     orig_vindices[1], orig_vindices[1],
                 ))
                 group_poly_indices.append(poly_idx)
+                poly_face_val.append(group_idx)
                 poly_idx += 1
 
             elif count == 4:
@@ -784,6 +895,7 @@ class SceneHandler:
                     orig_vindices[2], orig_vindices[1],
                 ))
                 group_poly_indices.append(poly_idx)
+                poly_face_val.append(group_idx)
                 poly_idx += 1
 
             else:
@@ -814,13 +926,14 @@ class SceneHandler:
                         orig_vindices[li_b], orig_vindices[li_b],
                     ))
                     group_poly_indices.append(poly_idx)
+                    poly_face_val.append(group_idx)
                     poly_idx += 1
 
             # Only groups with 2+ triangles need merging
             if len(group_poly_indices) > 1:
                 poly_groups.append(group_poly_indices)
 
-        return unique_pts, polys, normal_map, poly_groups
+        return unique_pts, polys, normal_map, poly_groups, corner_normals, poly_face_val
 
     # =========================================================================
     # Write geometry
@@ -835,45 +948,58 @@ class SceneHandler:
     # In-place geometry update
     # =========================================================================
 
-    def _update_object_geometry(self, obj, vertices, indices, faces, normals):
+    def _update_object_geometry(self, obj, vertices, indices, faces, normals,
+                                groups):
         """
         Replace all geometry on an existing PolygonObject in-place.
 
         Only the managed NormalTag is stripped; all user tags survive.
-        In N-gon mode (faces is non-empty), NormalTag is skipped entirely
-        because it would be invalidated by MCOMMAND_MELT. Phong handles shading.
+        In N-gon mode, the NormalTag and face map are applied AFTER melt
+        by _create_ngon_groups() — they cannot be built here because the
+        melt will change the polygon topology.
 
         Returns:
-            poly_groups (list[list[int]]) — non-empty in N-gon mode.
+            (poly_groups, corner_normals, poly_face_val, poly_face_map)
+
+            poly_groups:    list[list[int]] — non-empty in N-gon mode.
+            corner_normals: dict — for post-melt NormalTag (empty in tri mode).
+            poly_face_val:  list — group idx per pre-melt polygon (empty in tri mode).
+            poly_face_map:  list|None — poly→group map; set now for tri, None for ngon.
+
             The CALLER is responsible for running _create_ngon_groups() OUTSIDE
             any active StartUndo/EndUndo block, because SendModelingCommand
             (MCOMMAND_MELT) manages its own undo entries and fails silently
             when called inside an existing undo context.
         """
-        points, polys, normal_map, poly_groups = self._compute_geometry(
-            vertices, indices, faces, normals
-        )
+        points, polys, normal_map, poly_groups, corner_normals, poly_face_val = \
+            self._compute_geometry(vertices, indices, faces, normals, groups)
         if not polys:
-            return []
+            return [], {}, [], None
 
         self._strip_managed_tags(obj)
         obj.ResizeObject(len(points), len(polys))
         self._write_points_and_polys(obj, points, polys)
 
-        # Normals: tri mode only (N-gon mode skips to avoid post-melt stale data)
-        if not poly_groups and normals and normal_map:
-            self._apply_normals(obj, normals, normal_map)
+        poly_face_map = None
+        if not poly_groups:
+            # Tri mode: apply normals immediately and compute face map
+            if normals and normal_map:
+                self._apply_normals(obj, normals, normal_map)
+            poly_face_map = self._compute_tri_face_map(len(polys), groups)
 
         phong = obj.GetTag(c4d.Tphong)
         if not phong:
             phong = obj.MakeTag(c4d.Tphong)
             phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
+        # Tri mode: NormalTag is the authority → angle limit off.
+        # N-gon mode: keep angle limit as safety net until _create_ngon_groups
+        # applies the NormalTag and flips this to False.
         phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
 
         obj.Message(c4d.MSG_UPDATE)
 
         # Do NOT call _create_ngon_groups here — must run outside undo block.
-        return poly_groups
+        return poly_groups, corner_normals, poly_face_val, poly_face_map
 
     def _strip_managed_tags(self, obj):
         tag = obj.GetFirstTag()
@@ -884,11 +1010,11 @@ class SceneHandler:
             tag = next_tag
 
     # =========================================================================
-    # Custom normals (tri mode only)
+    # Custom normals
     # =========================================================================
 
     def _apply_normals(self, obj, normals, normal_map):
-        """Write per-corner normals. Tries modern SetPolygon API, falls back to int16."""
+        """Write per-corner normals (tri mode). Tries modern SetPolygon API, falls back to int16."""
         poly_count   = obj.GetPolygonCount()
         normal_count = len(normals) // 3
         if poly_count == 0 or normal_count == 0:
@@ -941,14 +1067,130 @@ class SceneHandler:
             raw = data.tobytes()
             buf[:len(raw)] = raw
 
+    @staticmethod
+    def _apply_normals_from_corner_map(obj, corner_normals, post_melt_face_map):
+        """
+        Write per-corner normals AFTER N-gon melt, using the pre-computed
+        corner_normals dict and the post-melt face map.
+
+        corner_normals stores (nx, ny, nz) float tuples (not c4d.Vector) to
+        keep memory usage low when accumulating data for many objects.
+        Conversion to c4d.Vector happens here, at write time.
+
+        For each post-melt polygon i:
+          - group_idx = post_melt_face_map[i]
+          - For each corner vertex v of the polygon:
+              normal = corner_normals[(v, group_idx)]
+          - Write to NormalTag slot i.
+
+        Falls back to (0, 1, 0) for any missing entries (should not happen
+        with well-formed Plasticity data).
+        """
+        poly_count = obj.GetPolygonCount()
+        if poly_count == 0 or not corner_normals:
+            return
+
+        fallback_t = (0.0, 1.0, 0.0)
+
+        # Strip any existing managed NormalTag
+        tag = obj.GetFirstTag()
+        while tag:
+            next_tag = tag.GetNext()
+            if tag.CheckType(c4d.Tnormal) and tag.GetName() == MANAGED_NORMAL_TAG_NAME:
+                tag.Remove()
+            tag = next_tag
+
+        tag = c4d.NormalTag(poly_count)
+        tag.SetName(MANAGED_NORMAL_TAG_NAME)
+        obj.InsertTag(tag)
+
+        def _get_normal(vert_idx, group_idx):
+            t = corner_normals.get((vert_idx, group_idx), fallback_t)
+            return c4d.Vector(t[0], t[1], t[2])
+
+        # Modern API (C4D 2023 / S26+)
+        try:
+            data_w = tag.GetDataAddressW()
+            for i in range(poly_count):
+                gi = post_melt_face_map[i] if i < len(post_melt_face_map) else 0
+                cp = obj.GetPolygon(i)
+                is_tri = (cp.c == cp.d)
+                c4d.NormalTag.SetPolygon(data_w, i, {
+                    'a': _get_normal(cp.a, gi),
+                    'b': _get_normal(cp.b, gi),
+                    'c': _get_normal(cp.c, gi),
+                    'd': _get_normal(cp.d, gi) if not is_tri
+                         else _get_normal(cp.c, gi),
+                })
+            return
+        except (AttributeError, TypeError):
+            pass
+
+        # Legacy API: raw int16 buffer
+        data = array.array('h')
+        def pack_n(v):
+            return int(max(-32767.0, min(32767.0, v * 32767.0)))
+
+        for i in range(poly_count):
+            gi = post_melt_face_map[i] if i < len(post_melt_face_map) else 0
+            cp = obj.GetPolygon(i)
+            is_tri = (cp.c == cp.d)
+            for vert_idx in (cp.a, cp.b, cp.c,
+                             cp.d if not is_tri else cp.c):
+                t = corner_normals.get((vert_idx, gi), fallback_t)
+                data.extend([pack_n(t[0]), pack_n(t[1]), pack_n(t[2])])
+
+        buf = tag.GetLowlevelDataAddressW()
+        if buf:
+            raw = data.tobytes()
+            buf[:len(raw)] = raw
+
+    # =========================================================================
+    # Poly-face map helpers
+    # =========================================================================
+
+    @staticmethod
+    def _compute_tri_face_map(poly_count, groups):
+        """
+        Build the poly_face_map for tri-mode geometry.
+
+        In tri mode each polygon covers exactly 3 loops, so polygon i
+        starts at loop i*3.  The groups array is [loop_start, loop_count, ...]
+        and we map each polygon to its 0-based group index.
+
+        Returns a list of ints, one per polygon.
+        """
+        if not groups or poly_count == 0:
+            return [0] * poly_count
+
+        # Build sorted group boundaries for binary search
+        n_groups = len(groups) // 2
+        # (loop_start, group_idx) sorted by loop_start
+        boundaries = sorted(
+            ((groups[gi * 2], gi) for gi in range(n_groups)),
+            key=lambda x: x[0],
+        )
+        b_keys = [b[0] for b in boundaries]
+
+        result = []
+        for pi in range(poly_count):
+            loop_pos = pi * 3
+            idx = bisect.bisect_right(b_keys, loop_pos) - 1
+            if idx >= 0:
+                result.append(boundaries[idx][1])
+            else:
+                result.append(0)
+        return result
+
     # =========================================================================
     # N-gon creation — MCOMMAND_MELT with polygon-identity hashing
     # =========================================================================
 
-    @staticmethod
-    def _create_ngon_groups(obj, poly_groups):
+    def _create_ngon_groups(self, obj, poly_groups, corner_normals,
+                            poly_face_val):
         """
-        Merge groups of adjacent triangles into C4D N-gons via MCOMMAND_MELT.
+        Merge groups of adjacent triangles into C4D N-gons via MCOMMAND_MELT,
+        then rebuild the NormalTag and poly_face_map for the post-melt topology.
 
         Problem: each MCOMMAND_MELT reduces the polygon count, shifting ALL
         subsequent polygon indices. Selecting polygons by their original index
@@ -963,16 +1205,36 @@ class SceneHandler:
           failure case — two polygons with identical vertex tuples — cannot occur
           in Plasticity's CAD-tessellated output.
 
+        After melt (Steps 5–7):
+          5. Rebuild poly_face_map for the post-melt topology by mapping each
+             polygon back to its Plasticity group index via vertex-identity
+             tracking (for survived polys) or vertex-set intersection (for
+             newly melted polys).
+          6. Apply NormalTag from corner_normals using the post-melt face map.
+          7. Store poly_face_map as metadata and flip Phong angle limit off.
+
         Args:
-            obj        : c4d.PolygonObject already in a document
-            poly_groups: list[list[int]] — each sub-list is original polygon
-                         indices (from _compute_ngon_geometry's poly_idx counter)
-                         that should be melted into a single N-gon.
+            obj            : c4d.PolygonObject already in a document
+            poly_groups    : list[list[int]] — each sub-list is original polygon
+                             indices that should be melted into a single N-gon.
+            corner_normals : dict {(welded_vert_idx, group_idx): (nx, ny, nz)}
+            poly_face_val  : list[int] — group_idx per pre-melt polygon.
 
         Ref: https://developers.maxon.net/forum/topic/13458/set-ngons-with-python/7
         """
         groups_to_melt = [g for g in poly_groups if len(g) >= 2]
         if not groups_to_melt:
+            # No melting needed — still build face map + normals for
+            # objects that were all tris/quads in ngon mode.
+            post_melt_face_map = poly_face_val[:]
+            if corner_normals:
+                self._apply_normals_from_corner_map(
+                    obj, corner_normals, post_melt_face_map)
+                phong = obj.GetTag(c4d.Tphong)
+                if phong:
+                    phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = False
+            self._store_poly_face_map(obj, post_melt_face_map)
+            obj.Message(c4d.MSG_UPDATE)
             return
 
         doc = obj.GetDocument()
@@ -984,6 +1246,13 @@ class SceneHandler:
             i: (cp.a, cp.b, cp.c, cp.d)
             for i, cp in enumerate(all_polys)
         }
+
+        # Also build identity→group_idx for post-melt face-map reconstruction.
+        # Every pre-melt polygon has a known group_idx from poly_face_val.
+        identity_to_group = {}
+        for orig_pid, id_key in polygon_identity.items():
+            if orig_pid < len(poly_face_val):
+                identity_to_group[id_key] = poly_face_val[orig_pid]
 
         # ── Step 1: Collect edges per group ──────────────────────────────────
         # Each polygon is a triangle (d == c) from ear-clip triangulation.
@@ -1085,12 +1354,81 @@ class SceneHandler:
                 print(f"[Plasticity] Warning: MCOMMAND_MELT failed for "
                       f"batch of {grp_count} groups")
 
+        # ── Step 5: Rebuild poly_face_map for the post-melt topology ─────────
+        # For each post-melt polygon, determine its Plasticity group index:
+        #   a) If its identity (a,b,c,d) exists in the pre-melt set → it
+        #      survived the melt unchanged. Look up its group_idx directly.
+        #   b) If the identity is NEW → it's a melted N-gon. Determine its
+        #      group_idx by intersecting: for each corner vertex, collect the
+        #      set of group_idxs that have entries in corner_normals for that
+        #      vertex. The intersection across all corners gives the face.
+        post_polys = obj.GetAllPolygons()
+        post_melt_face_map = []
+
+        # Build vert→group sets from corner_normals for fallback (step 5b).
+        vert_groups = {}   # welded_vert_idx → set of group_idxs
+        for (vi, gi) in corner_normals:
+            if vi not in vert_groups:
+                vert_groups[vi] = set()
+            vert_groups[vi].add(gi)
+
+        for cp in post_polys:
+            id_key = (cp.a, cp.b, cp.c, cp.d)
+
+            # 5a: survived polygon — identity matches a pre-melt polygon
+            gi = identity_to_group.get(id_key)
+            if gi is not None:
+                post_melt_face_map.append(gi)
+                continue
+
+            # 5b: new polygon (melted N-gon) — intersect corner vertex groups
+            is_tri = (cp.c == cp.d)
+            corner_verts = [cp.a, cp.b, cp.c]
+            if not is_tri:
+                corner_verts.append(cp.d)
+
+            # Start with the groups of the first corner vertex, then intersect
+            common = vert_groups.get(corner_verts[0], set()).copy()
+            for cv in corner_verts[1:]:
+                common &= vert_groups.get(cv, set())
+                if len(common) <= 1:
+                    break   # early out
+
+            if len(common) == 1:
+                post_melt_face_map.append(next(iter(common)))
+            elif len(common) > 1:
+                # Multiple candidates — pick the one with the most
+                # corner vertices matching (most specific).
+                # This shouldn't happen with well-formed Plasticity data,
+                # but handle it gracefully.
+                best_gi = next(iter(common))
+                post_melt_face_map.append(best_gi)
+            else:
+                # No match — shouldn't happen. Fall back to 0.
+                post_melt_face_map.append(0)
+
+        # ── Step 6: Apply NormalTag from corner_normals ──────────────────────
+        if corner_normals:
+            self._apply_normals_from_corner_map(
+                obj, corner_normals, post_melt_face_map)
+
+            # Flip Phong to defer to NormalTag
+            phong = obj.GetTag(c4d.Tphong)
+            if phong:
+                phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = False
+
+        # ── Step 7: Store poly_face_map as metadata ──────────────────────────
+        self._store_poly_face_map(obj, post_melt_face_map)
+
+        obj.Message(c4d.MSG_UPDATE)
+
     # =========================================================================
     # Metadata helpers
     # =========================================================================
 
     def _copy_plasticity_meta(self, obj, plasticity_id, filename,
-                              groups=None, face_ids=None):
+                              groups=None, face_ids=None,
+                              poly_face_map=None):
         bc = obj.GetDataInstance()
         bc.SetInt32(BC_PLASTICITY_ID, int(plasticity_id))
         bc.SetString(BC_PLASTICITY_FILENAME, str(filename))
@@ -1098,6 +1436,15 @@ class SceneHandler:
             bc.SetString(BC_PLASTICITY_GROUPS,   json.dumps(groups))
         if face_ids is not None:
             bc.SetString(BC_PLASTICITY_FACE_IDS, json.dumps(face_ids))
+        if poly_face_map is not None:
+            bc.SetString(BC_PLASTICITY_POLY_FACE_MAP,
+                         json.dumps(poly_face_map))
+
+    @staticmethod
+    def _store_poly_face_map(obj, poly_face_map):
+        """Store poly_face_map on an object's BaseContainer (outside _copy_plasticity_meta)."""
+        bc = obj.GetDataInstance()
+        bc.SetString(BC_PLASTICITY_POLY_FACE_MAP, json.dumps(poly_face_map))
 
     # =========================================================================
     # Scene-tree helpers
