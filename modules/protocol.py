@@ -46,6 +46,22 @@ class FacetShapeType(IntEnum):
 
 
 # =============================================================================
+# Encoding helpers
+# =============================================================================
+
+def _encode_string(s: str) -> bytes:
+    """Encode a UTF-8 string with a uint32 length prefix and 4-byte alignment padding."""
+    encoded = s.encode('utf-8')
+    padding = b'\x00' * ((4 - len(encoded) % 4) % 4)
+    return struct.pack("<I", len(encoded)) + encoded + padding
+
+
+def _encode_id_array(ids: List[int]) -> bytes:
+    """Encode a list of uint32 IDs with a uint32 count prefix."""
+    return struct.pack(f"<{len(ids) + 1}I", len(ids), *ids)
+
+
+# =============================================================================
 # Encoding (client -> server)
 # =============================================================================
 
@@ -65,16 +81,11 @@ def encode_unsubscribe(message_id: int) -> bytes:
     return struct.pack("<II", MessageType.UNSUBSCRIBE_ALL_1, message_id)
 
 
-def encode_subscribe_some(message_id: int, filename: str, plasticity_ids: List[int]) -> bytes:
-    msg = struct.pack("<II", MessageType.SUBSCRIBE_SOME_1, message_id)
-    fn = filename.encode('utf-8')
-    msg += struct.pack("<I", len(fn))
-    msg += fn
-    msg += b'\x00' * ((4 - len(fn) % 4) % 4)
-    msg += struct.pack("<I", len(plasticity_ids))
-    for pid in plasticity_ids:
-        msg += struct.pack("<I", pid)
-    return msg
+def encode_subscribe_some(message_id: int, filename: str,
+                          plasticity_ids: List[int]) -> bytes:
+    return (struct.pack("<II", MessageType.SUBSCRIBE_SOME_1, message_id)
+            + _encode_string(filename)
+            + _encode_id_array(plasticity_ids))
 
 
 def encode_refacet_some(
@@ -85,27 +96,19 @@ def encode_refacet_some(
     min_width=0.0, max_width=0.0, curve_chord_max=0.0,
     shape=FacetShapeType.CUT
 ) -> bytes:
-    msg = struct.pack("<II", MessageType.REFACET_SOME_1, message_id)
-    fn = filename.encode('utf-8')
-    msg += struct.pack("<I", len(fn))
-    msg += fn
-    msg += b'\x00' * ((4 - len(fn) % 4) % 4)
-    msg += struct.pack("<I", len(plasticity_ids))
-    for pid in plasticity_ids:
-        msg += struct.pack("<I", pid)
-    msg += struct.pack("<I", 1 if relative_to_bbox else 0)
-    msg += struct.pack("<f", curve_chord_tolerance)
-    msg += struct.pack("<f", curve_chord_angle)
-    msg += struct.pack("<f", surface_plane_tolerance)
-    msg += struct.pack("<f", surface_plane_angle)
-    msg += struct.pack("<I", 1 if match_topology else 0)
-    msg += struct.pack("<I", max_sides)
-    msg += struct.pack("<f", plane_angle)
-    msg += struct.pack("<f", min_width)
-    msg += struct.pack("<f", max_width)
-    msg += struct.pack("<f", curve_chord_max)
-    msg += struct.pack("<I", shape.value)
-    return msg
+    return (struct.pack("<II", MessageType.REFACET_SOME_1, message_id)
+            + _encode_string(filename)
+            + _encode_id_array(plasticity_ids)
+            + struct.pack(
+                "<IffffIIffffI",
+                1 if relative_to_bbox else 0,
+                curve_chord_tolerance, curve_chord_angle,
+                surface_plane_tolerance, surface_plane_angle,
+                1 if match_topology else 0,
+                max_sides, plane_angle,
+                min_width, max_width, curve_chord_max,
+                shape.value,
+            ))
 
 
 # =============================================================================

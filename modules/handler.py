@@ -274,6 +274,105 @@ def _ear_clip(pts_2d):
     return triangles
 
 
+# =============================================================================
+# Shared utility functions for reading Plasticity metadata from objects
+# =============================================================================
+
+def _get_poly_face_map(obj):
+    """Read and validate the poly-face map from a Plasticity polygon object.
+
+    Returns (poly_face_map, face_ids, poly_count) on success, or None if the
+    object is not a valid Plasticity polygon object or has no map data.
+
+    This consolidates the repeated "read BC, validate PID, parse JSON, check
+    poly_count" pattern used by all utility methods.
+    """
+    if not obj.CheckType(c4d.Opolygon):
+        return None
+
+    bc = obj.GetDataInstance()
+    if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+        return None
+
+    pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+    face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
+    if not pfm_str or not face_ids_str:
+        return None
+
+    poly_face_map = json.loads(pfm_str)
+    face_ids      = json.loads(face_ids_str)
+
+    poly_count = obj.GetPolygonCount()
+    if poly_count == 0 or not poly_face_map or not face_ids:
+        return None
+
+    return poly_face_map, face_ids, poly_count
+
+
+def _get_poly_face_map_only(obj):
+    """Like _get_poly_face_map but doesn't require face_ids.
+
+    Returns (poly_face_map, poly_count) on success, or None.
+    Used by methods that only need the face map (sharp edges, face/edge
+    selection).
+    """
+    if not obj.CheckType(c4d.Opolygon):
+        return None
+
+    bc = obj.GetDataInstance()
+    if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+        return None
+
+    pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+    if not pfm_str:
+        return None
+
+    poly_face_map = json.loads(pfm_str)
+    poly_count = obj.GetPolygonCount()
+    if poly_count == 0 or not poly_face_map:
+        return None
+
+    return poly_face_map, poly_count
+
+
+def _build_edge_map(obj, poly_face_map, poly_count):
+    """Build a global edge map for a polygon object.
+
+    Returns a dict: (min_vertex, max_vertex) → [(poly_idx, slot, group_idx), ...]
+
+    C4D edge addressing: poly_idx * 4 + slot, where slot 0..3 maps to
+    edges a→b, b→c, c→d, d→a respectively.  For triangles (d == c) slot 2
+    is degenerate and is skipped.
+
+    This consolidates the identical edge-map construction loop used by
+    _apply_edge_sel_tags_to_obj, _get_sharp_edge_addresses, and
+    _select_plasticity_edges_on_obj.
+    """
+    edge_map = {}
+    map_len  = min(len(poly_face_map), poly_count)
+
+    for poly_idx in range(map_len):
+        group_idx = poly_face_map[poly_idx]
+        cp        = obj.GetPolygon(poly_idx)
+        is_tri    = (cp.c == cp.d)
+
+        edge_slots = [
+            (0, cp.a, cp.b),
+            (1, cp.b, cp.c),
+            (3, cp.d, cp.a),
+        ]
+        if not is_tri:
+            edge_slots.append((2, cp.c, cp.d))
+
+        for slot, v1, v2 in edge_slots:
+            key = (min(v1, v2), max(v1, v2))
+            if key not in edge_map:
+                edge_map[key] = []
+            edge_map[key].append((poly_idx, slot, group_idx))
+
+    return edge_map
+
+
 class SceneHandler:
     def __init__(self, bridge: ThreadingBridge):
         self.bridge = bridge
@@ -311,6 +410,25 @@ class SceneHandler:
         self._items.clear()
         self._groups.clear()
         self._roots.clear()
+
+    # =========================================================================
+    # Deferred N-gon processing
+    # =========================================================================
+
+    def _process_deferred_ngons(self, deferred_ngons):
+        """Run MCOMMAND_MELT for each deferred N-gon entry.
+
+        Must be called OUTSIDE any active StartUndo/EndUndo block because
+        SendModelingCommand manages its own undo entries and fails silently
+        when called inside an existing undo context.
+
+        Each entry is nulled after processing to free corner_normals memory.
+        """
+        for i in range(len(deferred_ngons)):
+            obj, poly_groups, corner_normals, poly_face_val = deferred_ngons[i]
+            deferred_ngons[i] = None
+            self._create_ngon_groups(obj, poly_groups, corner_normals,
+                                     poly_face_val)
 
     # =========================================================================
     # Event handlers
@@ -365,13 +483,7 @@ class SceneHandler:
             doc.EndUndo()
 
         # MELT must run outside the undo block — SMC manages its own undo entries.
-        # Release each entry after processing to free corner_normals memory.
-        for i in range(len(deferred_ngons)):
-            obj, poly_groups, corner_normals, poly_face_val = deferred_ngons[i]
-            deferred_ngons[i] = None
-            self._create_ngon_groups(obj, poly_groups, corner_normals,
-                                     poly_face_val)
-
+        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
 
     def _on_transaction(self, event: BridgeEvent):
@@ -401,12 +513,7 @@ class SceneHandler:
             doc.EndUndo()
 
         # MELT must run outside the undo block — SMC manages its own undo entries.
-        for i in range(len(deferred_ngons)):
-            obj, poly_groups, corner_normals, poly_face_val = deferred_ngons[i]
-            deferred_ngons[i] = None
-            self._create_ngon_groups(obj, poly_groups, corner_normals,
-                                     poly_face_val)
-
+        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
 
     def _on_refacet_response(self, event: BridgeEvent):
@@ -426,7 +533,7 @@ class SceneHandler:
         if not doc:
             return
 
-        deferred_ngons = []   # [(obj, pg, cn, pfv)] — melted OUTSIDE undo block
+        deferred_ngons = []
 
         doc.StartUndo()
         try:
@@ -464,11 +571,7 @@ class SceneHandler:
 
         # SendModelingCommand(MCOMMAND_MELT) manages its own undo entries and
         # fails silently when called inside StartUndo/EndUndo — run it after.
-        for i in range(len(deferred_ngons)):
-            obj, pg, cn, pfv = deferred_ngons[i]
-            deferred_ngons[i] = None
-            self._create_ngon_groups(obj, pg, cn, pfv)
-
+        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
 
     def _on_new_version(self, event: BridgeEvent):
@@ -1572,6 +1675,7 @@ class SceneHandler:
         for obj in selection:
             collect(obj)
         return ids
+
     # =========================================================================
     # Utilities
     # =========================================================================
@@ -1603,25 +1707,10 @@ class SceneHandler:
 
     def _apply_face_sel_tags_to_obj(self, doc, obj):
         """Internal: add face-selection tags to a single object. Returns True on success."""
-        if not obj.CheckType(c4d.Opolygon):
+        result = _get_poly_face_map(obj)
+        if result is None:
             return False
-
-        bc  = obj.GetDataInstance()
-        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
-        if pid == 0:
-            return False
-
-        pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-        face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
-        if not pfm_str or not face_ids_str:
-            return False
-
-        poly_face_map = json.loads(pfm_str)
-        face_ids      = json.loads(face_ids_str)
-
-        poly_count = obj.GetPolygonCount()
-        if poly_count == 0 or not poly_face_map or not face_ids:
-            return False
+        poly_face_map, face_ids, poly_count = result
 
         # Strip any stale face-selection tags before creating new ones.
         # (This is also done by _strip_managed_tags on mesh update, but we call
@@ -1691,30 +1780,11 @@ class SceneHandler:
           - shared between two polygons belonging to different Plasticity face groups
             (a group-boundary edge), or
           - adjacent to only one polygon at all (a mesh-boundary edge).
-
-        C4D edge addressing: poly_idx * 4 + slot, where slot 0..3 maps to
-        edges a→b, b→c, c→d, d→a.  For triangles (d == c) slot 2 is
-        degenerate and is skipped.
         """
-        if not obj.CheckType(c4d.Opolygon):
+        result = _get_poly_face_map(obj)
+        if result is None:
             return False
-
-        bc  = obj.GetDataInstance()
-        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
-        if pid == 0:
-            return False
-
-        pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-        face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
-        if not pfm_str or not face_ids_str:
-            return False
-
-        poly_face_map = json.loads(pfm_str)
-        face_ids      = json.loads(face_ids_str)
-
-        poly_count = obj.GetPolygonCount()
-        if poly_count == 0 or not poly_face_map or not face_ids:
-            return False
+        poly_face_map, face_ids, poly_count = result
 
         # Strip any stale edges tag before creating a new one.
         tag = obj.GetFirstTag()
@@ -1728,29 +1798,7 @@ class SceneHandler:
 
         doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
 
-        # Build a global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
-        # across every polygon on the mesh.
-        edge_map = {}
-        map_len  = min(len(poly_face_map), poly_count)
-
-        for poly_idx in range(map_len):
-            group_idx = poly_face_map[poly_idx]
-            cp        = obj.GetPolygon(poly_idx)
-            is_tri    = (cp.c == cp.d)
-
-            edge_slots = [
-                (0, cp.a, cp.b),
-                (1, cp.b, cp.c),
-                (3, cp.d, cp.a),
-            ]
-            if not is_tri:
-                edge_slots.append((2, cp.c, cp.d))
-
-            for slot, v1, v2 in edge_slots:
-                key = (min(v1, v2), max(v1, v2))
-                if key not in edge_map:
-                    edge_map[key] = []
-                edge_map[key].append((poly_idx, slot, group_idx))
+        edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
         # Select edges that are on a group boundary or the mesh boundary.
         sel_tag = obj.MakeTag(c4d.Tedgeselection)
@@ -1805,46 +1853,13 @@ class SceneHandler:
         In smart mode, group-boundary edges are only included if the geometric
         normals of the two adjacent polygons differ by more than 5°.  Mesh-
         boundary edges are always included regardless of smart mode.
-
-        C4D edge addressing: poly_idx * 4 + slot
-          slot 0: a→b,  slot 1: b→c,  slot 2: c→d,  slot 3: d→a
         """
-        bc  = obj.GetDataInstance()
-        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
-        if pid == 0:
+        result = _get_poly_face_map_only(obj)
+        if result is None:
             return []
+        poly_face_map, poly_count = result
 
-        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-        if not pfm_str:
-            return []
-
-        poly_face_map = json.loads(pfm_str)
-        poly_count    = obj.GetPolygonCount()
-        if poly_count == 0 or not poly_face_map:
-            return []
-
-        # Build global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
-        edge_map = {}
-        map_len  = min(len(poly_face_map), poly_count)
-
-        for poly_idx in range(map_len):
-            group_idx = poly_face_map[poly_idx]
-            cp        = obj.GetPolygon(poly_idx)
-            is_tri    = (cp.c == cp.d)
-
-            edge_slots = [
-                (0, cp.a, cp.b),
-                (1, cp.b, cp.c),
-                (3, cp.d, cp.a),
-            ]
-            if not is_tri:
-                edge_slots.append((2, cp.c, cp.d))
-
-            for slot, v1, v2 in edge_slots:
-                key = (min(v1, v2), max(v1, v2))
-                if key not in edge_map:
-                    edge_map[key] = []
-                edge_map[key].append((poly_idx, slot, group_idx))
+        edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
         # Precompute geometric normals once if smart mode is active.
         if smart:
@@ -1854,12 +1869,12 @@ class SceneHandler:
             ]
             _COS_THRESHOLD = math.cos(math.radians(5.0))
 
-        result = []
+        addresses = []
         for occurrences in edge_map.values():
             if len(occurrences) == 1:
                 # Mesh boundary — always sharp.
                 poly_idx, slot, _ = occurrences[0]
-                result.append((poly_idx, slot))
+                addresses.append((poly_idx, slot))
 
             elif len(occurrences) == 2:
                 _, _, g0 = occurrences[0]
@@ -1874,10 +1889,10 @@ class SceneHandler:
                         continue   # normals nearly identical — treat as smooth
 
                 poly_idx, slot, _ = occurrences[0]
-                result.append((poly_idx, slot))
+                addresses.append((poly_idx, slot))
             # 3+ occurrences → non-manifold, ignored.
 
-        return result
+        return addresses
 
     # -------------------------------------------------------------------------
     # Mark Sharp (Phong Breaks)
@@ -1963,21 +1978,10 @@ class SceneHandler:
 
     def _select_plasticity_faces_on_obj(self, obj):
         """Internal: expand polygon selection to full groups on a single object."""
-        if not obj.CheckType(c4d.Opolygon):
+        result = _get_poly_face_map_only(obj)
+        if result is None:
             return False
-
-        bc  = obj.GetDataInstance()
-        if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
-            return False
-
-        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-        if not pfm_str:
-            return False
-
-        poly_face_map = json.loads(pfm_str)
-        poly_count    = obj.GetPolygonCount()
-        if poly_count == 0 or not poly_face_map:
-            return False
+        poly_face_map, poly_count = result
 
         poly_sel = obj.GetPolygonS()
         map_len  = min(len(poly_face_map), poly_count)
@@ -2034,21 +2038,10 @@ class SceneHandler:
 
     def _select_plasticity_edges_on_obj(self, obj):
         """Internal: select perimeter edges of selected groups on a single object."""
-        if not obj.CheckType(c4d.Opolygon):
+        result = _get_poly_face_map_only(obj)
+        if result is None:
             return False
-
-        bc  = obj.GetDataInstance()
-        if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
-            return False
-
-        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-        if not pfm_str:
-            return False
-
-        poly_face_map = json.loads(pfm_str)
-        poly_count    = obj.GetPolygonCount()
-        if poly_count == 0 or not poly_face_map:
-            return False
+        poly_face_map, poly_count = result
 
         poly_sel = obj.GetPolygonS()
         map_len  = min(len(poly_face_map), poly_count)
@@ -2062,26 +2055,7 @@ class SceneHandler:
         if not selected_groups:
             return False
 
-        # Build global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
-        edge_map = {}
-        for poly_idx in range(map_len):
-            group_idx = poly_face_map[poly_idx]
-            cp        = obj.GetPolygon(poly_idx)
-            is_tri    = (cp.c == cp.d)
-
-            edge_slots = [
-                (0, cp.a, cp.b),
-                (1, cp.b, cp.c),
-                (3, cp.d, cp.a),
-            ]
-            if not is_tri:
-                edge_slots.append((2, cp.c, cp.d))
-
-            for slot, v1, v2 in edge_slots:
-                key = (min(v1, v2), max(v1, v2))
-                if key not in edge_map:
-                    edge_map[key] = []
-                edge_map[key].append((poly_idx, slot, group_idx))
+        edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
         # Select perimeter edges of the combined selected-group region:
         #   - mesh-boundary edge (1 occurrence) whose polygon is in a selected group

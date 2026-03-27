@@ -32,6 +32,24 @@ from modules.threading_bridge import (
 
 MAX_SIZE = 2 ** 32 - 1
 
+# Mapping from protocol MessageType to bridge EventType for dispatch.
+_TYPE_TO_EVENT = {
+    MessageType.LIST_ALL_1:     EventType.LIST_RESPONSE,
+    MessageType.LIST_SOME_1:    EventType.LIST_RESPONSE,
+    MessageType.LIST_VISIBLE_1: EventType.LIST_RESPONSE,
+    MessageType.TRANSACTION_1:  EventType.TRANSACTION,
+    MessageType.REFACET_SOME_1: EventType.REFACET_RESPONSE,
+    MessageType.NEW_VERSION_1:  EventType.NEW_VERSION,
+    MessageType.NEW_FILE_1:     EventType.NEW_FILE,
+}
+
+# Message types that carry a filename to track on the client/bridge.
+_FILENAME_TYPES = frozenset({
+    MessageType.LIST_ALL_1, MessageType.LIST_SOME_1,
+    MessageType.LIST_VISIBLE_1, MessageType.TRANSACTION_1,
+    MessageType.NEW_VERSION_1, MessageType.NEW_FILE_1,
+})
+
 
 class PlasticityClient:
     """
@@ -199,45 +217,22 @@ class PlasticityClient:
             traceback.print_exc()
 
     def _dispatch_parsed(self, parsed: dict):
+        """Route a parsed message to the bridge as a typed event.
+
+        Uses _TYPE_TO_EVENT for the message-type → event-type mapping and
+        _FILENAME_TYPES to decide whether to track the filename.
+        """
         msg_type = parsed.get('type')
+        event_type = _TYPE_TO_EVENT.get(msg_type)
+        if event_type is None:
+            return
 
-        if msg_type in (MessageType.LIST_ALL_1, MessageType.LIST_SOME_1,
-                        MessageType.LIST_VISIBLE_1):
+        if msg_type in _FILENAME_TYPES:
             fn = parsed.get('filename', '')
             self.filename = fn
             self.bridge.filename = fn
-            self.bridge.push_event(BridgeEvent(
-                event_type=EventType.LIST_RESPONSE, data=parsed
-            ))
 
-        elif msg_type == MessageType.TRANSACTION_1:
-            fn = parsed.get('filename', '')
-            self.filename = fn
-            self.bridge.filename = fn
-            self.bridge.push_event(BridgeEvent(
-                event_type=EventType.TRANSACTION, data=parsed
-            ))
-
-        elif msg_type == MessageType.REFACET_SOME_1:
-            self.bridge.push_event(BridgeEvent(
-                event_type=EventType.REFACET_RESPONSE, data=parsed
-            ))
-
-        elif msg_type == MessageType.NEW_VERSION_1:
-            fn = parsed.get('filename', '')
-            self.filename = fn
-            self.bridge.filename = fn
-            self.bridge.push_event(BridgeEvent(
-                event_type=EventType.NEW_VERSION, data=parsed
-            ))
-
-        elif msg_type == MessageType.NEW_FILE_1:
-            fn = parsed.get('filename', '')
-            self.filename = fn
-            self.bridge.filename = fn
-            self.bridge.push_event(BridgeEvent(
-                event_type=EventType.NEW_FILE, data=parsed
-            ))
+        self.bridge.push_event(BridgeEvent(event_type=event_type, data=parsed))
 
     # =========================================================================
     # Async send helper
