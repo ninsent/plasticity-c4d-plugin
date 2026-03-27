@@ -51,6 +51,7 @@ import c4d
 import array
 import bisect
 import json
+import math
 from typing import Dict, List, Optional, Any, Set, Tuple
 
 from modules.protocol import ObjectType, MessageType
@@ -1772,5 +1773,166 @@ class SceneHandler:
                     bs.Select(poly_idx * 4 + slot)
             # Edges shared by 3+ polygons (non-manifold) are ignored.
 
+        obj.Message(c4d.MSG_UPDATE)
+        return True
+
+    # -------------------------------------------------------------------------
+    # Shared sharp-edge helpers
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _poly_geometric_normal(obj, cp):
+        """Unit face normal computed from vertex positions via cross product.
+
+        Uses the first three corners (a, b, c) — valid for both tris and quads
+        as long as the face is not degenerate.  Returns (0, 1, 0) on failure.
+        """
+        a = obj.GetPoint(cp.a)
+        b = obj.GetPoint(cp.b)
+        c = obj.GetPoint(cp.c)
+        n = (b - a).Cross(c - a)
+        length = n.GetLength()
+        return n / length if length > 1e-12 else c4d.Vector(0.0, 1.0, 0.0)
+
+    @staticmethod
+    def _get_sharp_edge_addresses(obj, smart):
+        """Return a list of (poly_idx, slot) for all sharp edges on obj.
+
+        An edge is sharp if it is either:
+          - a mesh-boundary edge (only one polygon), or
+          - a group-boundary edge (two polygons from different face groups).
+
+        In smart mode, group-boundary edges are only included if the geometric
+        normals of the two adjacent polygons differ by more than 5°.  Mesh-
+        boundary edges are always included regardless of smart mode.
+
+        C4D edge addressing: poly_idx * 4 + slot
+          slot 0: a→b,  slot 1: b→c,  slot 2: c→d,  slot 3: d→a
+        """
+        bc  = obj.GetDataInstance()
+        pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
+        if pid == 0:
+            return []
+
+        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+        if not pfm_str:
+            return []
+
+        poly_face_map = json.loads(pfm_str)
+        poly_count    = obj.GetPolygonCount()
+        if poly_count == 0 or not poly_face_map:
+            return []
+
+        # Build global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
+        edge_map = {}
+        map_len  = min(len(poly_face_map), poly_count)
+
+        for poly_idx in range(map_len):
+            group_idx = poly_face_map[poly_idx]
+            cp        = obj.GetPolygon(poly_idx)
+            is_tri    = (cp.c == cp.d)
+
+            edge_slots = [
+                (0, cp.a, cp.b),
+                (1, cp.b, cp.c),
+                (3, cp.d, cp.a),
+            ]
+            if not is_tri:
+                edge_slots.append((2, cp.c, cp.d))
+
+            for slot, v1, v2 in edge_slots:
+                key = (min(v1, v2), max(v1, v2))
+                if key not in edge_map:
+                    edge_map[key] = []
+                edge_map[key].append((poly_idx, slot, group_idx))
+
+        # Precompute geometric normals once if smart mode is active.
+        if smart:
+            poly_normals = [
+                SceneHandler._poly_geometric_normal(obj, obj.GetPolygon(pi))
+                for pi in range(poly_count)
+            ]
+            _COS_THRESHOLD = math.cos(math.radians(5.0))
+
+        result = []
+        for occurrences in edge_map.values():
+            if len(occurrences) == 1:
+                # Mesh boundary — always sharp.
+                poly_idx, slot, _ = occurrences[0]
+                result.append((poly_idx, slot))
+
+            elif len(occurrences) == 2:
+                _, _, g0 = occurrences[0]
+                _, _, g1 = occurrences[1]
+                if g0 == g1:
+                    continue   # interior edge — not sharp
+
+                if smart:
+                    pi0 = occurrences[0][0]
+                    pi1 = occurrences[1][0]
+                    if poly_normals[pi0].Dot(poly_normals[pi1]) >= _COS_THRESHOLD:
+                        continue   # normals nearly identical — treat as smooth
+
+                poly_idx, slot, _ = occurrences[0]
+                result.append((poly_idx, slot))
+            # 3+ occurrences → non-manifold, ignored.
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # Mark Sharp (Phong Breaks)
+    # -------------------------------------------------------------------------
+
+    def apply_phong_breaks(self, doc, smart=False):
+        """Apply Phong Breaks to sharp Plasticity edges on selected objects.
+
+        Sharp edges (group boundaries and mesh boundaries) are marked as Phong
+        Breaks via MCOMMAND_SETPHONGBREAKS.  The PhongTag's angle-limit flag is
+        left as-is; the NormalTag (when present) continues to govern shading.
+        Phong break data is reset naturally by ResizeObject on every geometry
+        update, so re-running the utility always gives a clean result.
+        """
+        if not doc:
+            return False
+
+        selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+        affected  = 0
+
+        for obj in selection:
+            if self._apply_phong_breaks_to_obj(doc, obj, smart):
+                affected += 1
+
+        c4d.EventAdd()
+        return affected > 0
+
+    def _apply_phong_breaks_to_obj(self, doc, obj, smart):
+        """Internal: apply Phong Breaks to a single object. Returns True on success."""
+        if not obj.CheckType(c4d.Opolygon):
+            return False
+
+        addresses = self._get_sharp_edge_addresses(obj, smart)
+        if not addresses:
+            return False
+
+        # Write the sharp-edge selection into the object's edge BaseSelect,
+        # then call MCOMMAND_SETPHONGBREAKS to commit the breaks, then clear
+        # the viewport selection so the user's selection is not disturbed.
+        edge_sel = obj.GetEdgeS()
+        prev_sel = edge_sel.GetClone()   # preserve existing viewport selection
+
+        edge_sel.DeselectAll()
+        for poly_idx, slot in addresses:
+            edge_sel.Select(poly_idx * 4 + slot)
+
+        c4d.utils.SendModelingCommand(
+            command=c4d.MCOMMAND_SETPHONGBREAKS,
+            list=[obj],
+            mode=c4d.MODELINGCOMMANDMODE_EDGESELECTION,
+            bc=c4d.BaseContainer(),
+            doc=doc,
+        )
+
+        # Restore the previous viewport edge selection.
+        edge_sel.CopyTo(prev_sel) if prev_sel else edge_sel.DeselectAll()
         obj.Message(c4d.MSG_UPDATE)
         return True

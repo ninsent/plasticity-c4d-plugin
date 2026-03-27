@@ -68,6 +68,8 @@ class IDS:
     # Utilities tab
     BTN_STORE_FACES      = 1901
     BTN_STORE_EDGES      = 1902
+    BTN_MARK_SHARP       = 1903
+    CHK_SMART_EDGES      = 1905
 
 
 def _add_section_header(dlg, gadget_id, title):
@@ -343,6 +345,24 @@ class PlasticityDialog(gui.GeDialog):
                     self.GroupEnd()
                 self.GroupEnd()
 
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 0, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
+                                       name="Auto Mark Edges")
+                    self.AddButton(IDS.BTN_MARK_SHARP, c4d.BFH_SCALEFIT,
+                                   name="Mark Sharp (PhongBreak)")
+                self.GroupEnd()
+
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 0, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
+                    self.AddCheckbox(IDS.CHK_SMART_EDGES, c4d.BFH_LEFT,
+                                     initw=0, inith=0,
+                                     name="Smart Edge Marking")
+                self.GroupEnd()
+
             self.GroupEnd()  # GRP_TAB_UTILITIES
 
         self.GroupEnd()  # GRP_MAIN
@@ -500,6 +520,9 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_STORE_EDGES:
             self._do_store_edges()
 
+        elif id == IDS.BTN_MARK_SHARP:
+            self._do_mark_sharp_edges()
+
         return True
 
     # =========================================================================
@@ -517,6 +540,7 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.EDT_SERVER,     not connected)
         self.Enable(IDS.BTN_STORE_FACES, not self._busy)
         self.Enable(IDS.BTN_STORE_EDGES, not self._busy)
+        self.Enable(IDS.BTN_MARK_SHARP,  not self._busy)
 
         status = self.bridge.status_message
         self.SetString(IDS.LBL_STATUS,   f"Status: {status}")
@@ -634,6 +658,21 @@ class PlasticityDialog(gui.GeDialog):
         if not doc:
             return
         affected = self.handler.apply_edge_selection_tags(doc)
+        if not affected:
+            gui.MessageDialog(
+                "No Plasticity objects selected.\n"
+                "Select one or more Plasticity mesh objects first.")
+
+    # =========================================================================
+    # Auto Mark Edges
+    # =========================================================================
+
+    def _do_mark_sharp_edges(self):
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return
+        smart    = self.GetBool(IDS.CHK_SMART_EDGES)
+        affected = self.handler.apply_phong_breaks(doc, smart=smart)
         if not affected:
             gui.MessageDialog(
                 "No Plasticity objects selected.\n"
