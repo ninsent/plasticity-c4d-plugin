@@ -6,7 +6,7 @@ Based on the Plasticity Blender Bridge addon by Nick Kallen.
 
 Author:     Nursultan Akim
 GitHub:     https://github.com/ninsent
-Repository: https://github.com/ninsent/plasticity-bridge-c4d
+Repository: https://github.com/ninsent/plasticity-c4d-plugin
 License:    MIT
 
 Installation
@@ -31,4 +31,4 @@ Usage
 4. Click Refresh to import, or enable Live Link for real-time sync.
 
 For full documentation, visit:
-https://github.com/ninsent/plasticity-bridge-c4d
+https://github.com/ninsent/plasticity-c4d-plugin

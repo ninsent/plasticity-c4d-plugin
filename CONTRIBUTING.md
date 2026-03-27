@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Plasticity Bridge! Contributions,
 
 1. Fork and clone the repository:
 ```bash
-git clone https://github.com/yourusername/plasticity-bridge-c4d.git
+git clone https://github.com/ninsent/plasticity-c4d-plugin.git
 ```
 
 2. Install the plugin in Cinema 4D:
