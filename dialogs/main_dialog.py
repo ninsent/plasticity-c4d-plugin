@@ -70,6 +70,8 @@ class IDS:
     BTN_STORE_EDGES      = 1902
     BTN_MARK_SHARP       = 1903
     CHK_SMART_EDGES      = 1905
+    BTN_SELECT_FACE      = 1906
+    BTN_SELECT_EDGE      = 1907
 
 
 def _add_section_header(dlg, gadget_id, title):
@@ -150,7 +152,7 @@ class PlasticityDialog(gui.GeDialog):
             if self._quicktab:
                 self._quicktab.AppendString(TAB_SERVER,    "Server",    True)
                 self._quicktab.AppendString(TAB_BASIC,     "Basic",     True)
-                self._quicktab.AppendString(TAB_UTILITIES, "Utilities", False)
+                self._quicktab.AppendString(TAB_UTILITIES, "Utilities", True)
 
             # ── Tab: Server ──────────────────────────────────────────────
             if self.GroupBegin(IDS.GRP_TAB_SERVER,
@@ -349,9 +351,22 @@ class PlasticityDialog(gui.GeDialog):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
                     self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
-                                       name="Auto Mark Edges")
+                                       name="Select")
+                    if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                        self.AddButton(IDS.BTN_SELECT_FACE, c4d.BFH_SCALEFIT,
+                                       name="Plasticity Face(s)")
+                        self.AddButton(IDS.BTN_SELECT_EDGE, c4d.BFH_SCALEFIT,
+                                       name="Plasticity Edges")
+                    self.GroupEnd()
+                self.GroupEnd()
+
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 0, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
+                                       name="Mark")
                     self.AddButton(IDS.BTN_MARK_SHARP, c4d.BFH_SCALEFIT,
-                                   name="Mark Sharp (PhongBreak)")
+                                   name="Mark Sharp Edges (PhongBreak)")
                 self.GroupEnd()
 
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
@@ -520,6 +535,12 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_STORE_EDGES:
             self._do_store_edges()
 
+        elif id == IDS.BTN_SELECT_FACE:
+            self._do_select_plasticity_faces()
+
+        elif id == IDS.BTN_SELECT_EDGE:
+            self._do_select_plasticity_edges()
+
         elif id == IDS.BTN_MARK_SHARP:
             self._do_mark_sharp_edges()
 
@@ -534,13 +555,30 @@ class PlasticityDialog(gui.GeDialog):
 
         self.Enable(IDS.BTN_CONNECT,    not connected and not self._busy)
         self.Enable(IDS.BTN_DISCONNECT, connected)
+        self.Enable(IDS.EDT_SERVER,     not connected)
         self.Enable(IDS.BTN_REFRESH,    connected and not self._busy)
         self.Enable(IDS.CHK_LIVELINK,   connected)
+        self.Enable(IDS.SLD_UNIT_SCALE, connected)
+        self.Enable(IDS.CHK_ONLY_VISIBLE, connected)
         self.Enable(IDS.BTN_REFACET,    connected and not self._busy)
-        self.Enable(IDS.EDT_SERVER,     not connected)
-        self.Enable(IDS.BTN_STORE_FACES, not self._busy)
-        self.Enable(IDS.BTN_STORE_EDGES, not self._busy)
-        self.Enable(IDS.BTN_MARK_SHARP,  not self._busy)
+        self.Enable(IDS.TOGGLE_TOPOLOGY,     connected)
+        self.Enable(IDS.TOGGLE_REFACET_OPTS, connected)
+        self.Enable(IDS.SLD_TOLERANCE,       connected)
+        self.Enable(IDS.SLD_ANGLE,           connected)
+        self.Enable(IDS.SLD_MIN_WIDTH,       connected)
+        self.Enable(IDS.SLD_MAX_WIDTH,       connected)
+        self.Enable(IDS.SLD_CURVE_CHORD_TOL, connected)
+        self.Enable(IDS.SLD_CURVE_CHORD_ANG, connected)
+        self.Enable(IDS.SLD_SURF_PLANE_TOL,  connected)
+        self.Enable(IDS.SLD_SURF_ANGLE_TOL,  connected)
+        doc = c4d.documents.GetActiveDocument()
+        in_poly_mode = bool(doc and doc.GetMode() == c4d.Mpolygons)
+        self.Enable(IDS.BTN_STORE_FACES, connected and not self._busy)
+        self.Enable(IDS.BTN_STORE_EDGES, connected and not self._busy)
+        self.Enable(IDS.BTN_SELECT_FACE, connected and not self._busy and in_poly_mode)
+        self.Enable(IDS.BTN_SELECT_EDGE, connected and not self._busy and in_poly_mode)
+        self.Enable(IDS.BTN_MARK_SHARP,  connected and not self._busy)
+        self.Enable(IDS.CHK_SMART_EDGES, connected)
 
         status = self.bridge.status_message
         self.SetString(IDS.LBL_STATUS,   f"Status: {status}")
@@ -662,6 +700,30 @@ class PlasticityDialog(gui.GeDialog):
             gui.MessageDialog(
                 "No Plasticity objects selected.\n"
                 "Select one or more Plasticity mesh objects first.")
+
+    # =========================================================================
+    # Select Plasticity Face(s) / Edges
+    # =========================================================================
+
+    def _do_select_plasticity_faces(self):
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return
+        affected = self.handler.select_plasticity_faces(doc)
+        if not affected:
+            gui.MessageDialog(
+                "No Plasticity faces selected.\n"
+                "Select one or more polygons on a Plasticity object first.")
+
+    def _do_select_plasticity_edges(self):
+        doc = c4d.documents.GetActiveDocument()
+        if not doc:
+            return
+        affected = self.handler.select_plasticity_edges(doc)
+        if not affected:
+            gui.MessageDialog(
+                "No Plasticity faces selected.\n"
+                "Select one or more polygons on a Plasticity object first.")
 
     # =========================================================================
     # Auto Mark Edges

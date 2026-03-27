@@ -1936,3 +1936,173 @@ class SceneHandler:
         edge_sel.CopyTo(prev_sel) if prev_sel else edge_sel.DeselectAll()
         obj.Message(c4d.MSG_UPDATE)
         return True
+
+    # -------------------------------------------------------------------------
+    # Select Plasticity Face(s)
+    # -------------------------------------------------------------------------
+
+    def select_plasticity_faces(self, doc):
+        """Expand the current polygon selection to whole Plasticity face groups.
+
+        For every selected polygon, the full group it belongs to (per
+        poly_face_map) is added to the selection.  Intended for use in polygon
+        mode — the caller is responsible for verifying doc.GetMode().
+        """
+        if not doc:
+            return False
+
+        selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+        affected  = 0
+
+        for obj in selection:
+            if self._select_plasticity_faces_on_obj(obj):
+                affected += 1
+
+        c4d.EventAdd()
+        return affected > 0
+
+    def _select_plasticity_faces_on_obj(self, obj):
+        """Internal: expand polygon selection to full groups on a single object."""
+        if not obj.CheckType(c4d.Opolygon):
+            return False
+
+        bc  = obj.GetDataInstance()
+        if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+            return False
+
+        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+        if not pfm_str:
+            return False
+
+        poly_face_map = json.loads(pfm_str)
+        poly_count    = obj.GetPolygonCount()
+        if poly_count == 0 or not poly_face_map:
+            return False
+
+        poly_sel = obj.GetPolygonS()
+        map_len  = min(len(poly_face_map), poly_count)
+
+        # Collect the group indices of all currently selected polygons.
+        selected_groups = set()
+        for pi in range(map_len):
+            if poly_sel.IsSelected(pi):
+                selected_groups.add(poly_face_map[pi])
+
+        if not selected_groups:
+            return False
+
+        # Select every polygon that belongs to any of those groups.
+        for pi in range(map_len):
+            if poly_face_map[pi] in selected_groups:
+                poly_sel.Select(pi)
+
+        obj.Message(c4d.MSG_UPDATE)
+        return True
+
+    # -------------------------------------------------------------------------
+    # Select Plasticity Edges
+    # -------------------------------------------------------------------------
+
+    def select_plasticity_edges(self, doc):
+        """Select the perimeter edges of the current Plasticity face-group
+        selection, then switch the document to edge mode.
+
+        Starting from the current polygon selection, the method finds the
+        combined group indices, then selects all boundary edges of that region
+        (edges on the mesh boundary or adjacent to a different group).  The
+        document mode is then set to c4d.Medges so the edge selection is
+        immediately visible.
+
+        Intended for use in polygon mode — the caller is responsible for
+        verifying doc.GetMode() before calling.
+        """
+        if not doc:
+            return False
+
+        selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+        affected  = 0
+
+        for obj in selection:
+            if self._select_plasticity_edges_on_obj(obj):
+                affected += 1
+
+        if affected:
+            doc.SetMode(c4d.Medges)
+            c4d.EventAdd()
+
+        return affected > 0
+
+    def _select_plasticity_edges_on_obj(self, obj):
+        """Internal: select perimeter edges of selected groups on a single object."""
+        if not obj.CheckType(c4d.Opolygon):
+            return False
+
+        bc  = obj.GetDataInstance()
+        if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+            return False
+
+        pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
+        if not pfm_str:
+            return False
+
+        poly_face_map = json.loads(pfm_str)
+        poly_count    = obj.GetPolygonCount()
+        if poly_count == 0 or not poly_face_map:
+            return False
+
+        poly_sel = obj.GetPolygonS()
+        map_len  = min(len(poly_face_map), poly_count)
+
+        # Collect the group indices of all currently selected polygons.
+        selected_groups = set()
+        for pi in range(map_len):
+            if poly_sel.IsSelected(pi):
+                selected_groups.add(poly_face_map[pi])
+
+        if not selected_groups:
+            return False
+
+        # Build global edge map: (min_v, max_v) → [(poly_idx, slot, group_idx)]
+        edge_map = {}
+        for poly_idx in range(map_len):
+            group_idx = poly_face_map[poly_idx]
+            cp        = obj.GetPolygon(poly_idx)
+            is_tri    = (cp.c == cp.d)
+
+            edge_slots = [
+                (0, cp.a, cp.b),
+                (1, cp.b, cp.c),
+                (3, cp.d, cp.a),
+            ]
+            if not is_tri:
+                edge_slots.append((2, cp.c, cp.d))
+
+            for slot, v1, v2 in edge_slots:
+                key = (min(v1, v2), max(v1, v2))
+                if key not in edge_map:
+                    edge_map[key] = []
+                edge_map[key].append((poly_idx, slot, group_idx))
+
+        # Select perimeter edges of the combined selected-group region:
+        #   - mesh-boundary edge (1 occurrence) whose polygon is in a selected group
+        #   - shared edge (2 occurrences) where exactly one side is a selected group
+        edge_sel = obj.GetEdgeS()
+        edge_sel.DeselectAll()
+
+        for occurrences in edge_map.values():
+            if len(occurrences) == 1:
+                poly_idx, slot, g = occurrences[0]
+                if g in selected_groups:
+                    edge_sel.Select(poly_idx * 4 + slot)
+            elif len(occurrences) == 2:
+                _, _, g0 = occurrences[0]
+                _, _, g1 = occurrences[1]
+                in0 = g0 in selected_groups
+                in1 = g1 in selected_groups
+                if in0 != in1:   # exactly one side is selected
+                    poly_idx, slot, _ = occurrences[0]
+                    edge_sel.Select(poly_idx * 4 + slot)
+            # 3+ occurrences → non-manifold, ignored.
+
+        obj.Message(c4d.MSG_UPDATE)
+        return True
