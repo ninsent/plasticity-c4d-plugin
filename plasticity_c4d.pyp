@@ -58,6 +58,8 @@ class PlasticityCommand(c4d.plugins.CommandData):
             self.threading_bridge = ThreadingBridge()
             self.handler = SceneHandler(self.threading_bridge)
             self.client = PlasticityClient(self.handler, self.threading_bridge)
+            # v2.1.0: back-reference so handler can invoke client methods
+            self.handler.client = self.client
             self.dialog = PlasticityDialog(
                 self.client, self.handler, self.threading_bridge
             )

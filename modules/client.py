@@ -25,6 +25,7 @@ from modules.protocol import (
     MessageType, MessageParser, FacetShapeType,
     encode_list_all, encode_list_visible, encode_subscribe_all,
     encode_subscribe_some, encode_unsubscribe, encode_refacet_some,
+    encode_handshake, encode_put_some,
 )
 from modules.threading_bridge import (
     ThreadingBridge, BridgeEvent, EventType, StatusReporter,
@@ -41,6 +42,8 @@ _TYPE_TO_EVENT = {
     MessageType.REFACET_SOME_1: EventType.REFACET_RESPONSE,
     MessageType.NEW_VERSION_1:  EventType.NEW_VERSION,
     MessageType.NEW_FILE_1:     EventType.NEW_FILE,
+    MessageType.HANDSHAKE_1:    EventType.HANDSHAKE_RESPONSE,
+    MessageType.PUT_SOME_1:     EventType.PUT_SOME_RESPONSE,
 }
 
 # Message types that carry a filename to track on the client/bridge.
@@ -75,9 +78,18 @@ class PlasticityClient:
         self._running = False
         self._parser = MessageParser()
 
+        # v2.1.0: handshake / capability negotiation
+        self.supported_messages = set()
+        # v2.1.0: callback invoked after list response is processed
+        self.on_list_complete = None
+
     @property
     def connected(self) -> bool:
         return self.bridge.connected
+
+    def supports(self, message_type: MessageType) -> bool:
+        """Check whether the server supports a given message type."""
+        return message_type.value in self.supported_messages
 
     # =========================================================================
     # Connection management
@@ -136,6 +148,8 @@ class PlasticityClient:
         self.websocket = None
         self.filename = None
         self.subscribed = False
+        self.supported_messages = set()
+        self.on_list_complete = None
 
     def _run_event_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -165,8 +179,9 @@ class PlasticityClient:
                 self.message_id = 0
                 self.bridge.push_event(BridgeEvent(event_type=EventType.CONNECTED))
                 self.status.info(f"Connected to {self.server}")
-                # Fix #1: on_connect is triggered by the CONNECTED event callback
-                # on the main thread — not called directly here.
+
+                # v2.1.0: send handshake immediately after connecting
+                await self._send_handshake()
 
                 while self._running:
                     try:
@@ -217,11 +232,7 @@ class PlasticityClient:
             traceback.print_exc()
 
     def _dispatch_parsed(self, parsed: dict):
-        """Route a parsed message to the bridge as a typed event.
-
-        Uses _TYPE_TO_EVENT for the message-type → event-type mapping and
-        _FILENAME_TYPES to decide whether to track the filename.
-        """
+        """Route a parsed message to the bridge as a typed event."""
         msg_type = parsed.get('type')
         event_type = _TYPE_TO_EVENT.get(msg_type)
         if event_type is None:
@@ -235,7 +246,7 @@ class PlasticityClient:
         self.bridge.push_event(BridgeEvent(event_type=event_type, data=parsed))
 
     # =========================================================================
-    # Async send helper
+    # Async send helpers
     # =========================================================================
 
     def _run_async(self, coro) -> Optional[Future]:
@@ -269,15 +280,17 @@ class PlasticityClient:
     # Public API
     # =========================================================================
 
-    def list_all(self):
+    def list_all(self, on_complete=None):
         if not self.connected:
             return
+        self.on_list_complete = on_complete
         self.status.info("Refreshing all objects...")
         self._send_and_wait(self._send(encode_list_all))
 
-    def list_visible(self):
+    def list_visible(self, on_complete=None):
         if not self.connected:
             return
+        self.on_list_complete = on_complete
         self.status.info("Refreshing visible objects...")
         self._send_and_wait(self._send(encode_list_visible))
 
@@ -306,9 +319,27 @@ class PlasticityClient:
         self.status.info(f"Refaceting {len(plasticity_ids)} objects...")
         self._send_and_wait(self._send_refacet(filename, plasticity_ids, **kwargs))
 
+    def put_some(self, filename: str, groups: list, items: list):
+        """Upload outbox meshes to Plasticity (v2.1.0)."""
+        if not self.connected:
+            return
+        self.status.info(
+            f"Uploading {len(groups)} groups and {len(items)} items to Plasticity...")
+        self._send_and_wait(
+            self._send_put_some(filename, groups, items), timeout=30.0)
+
+    # =========================================================================
+    # Async send implementations
+    # =========================================================================
+
     async def _send(self, encode_fn):
         self.message_id += 1
         msg = encode_fn(self.message_id)
+        await self.websocket.send(msg)
+
+    async def _send_handshake(self):
+        self.message_id += 1
+        msg = encode_handshake(self.message_id)
         await self.websocket.send(msg)
 
     async def _send_subscribe_some(self, filename, ids):
@@ -319,4 +350,9 @@ class PlasticityClient:
     async def _send_refacet(self, filename, ids, **kwargs):
         self.message_id += 1
         msg = encode_refacet_some(self.message_id, filename, ids, **kwargs)
+        await self.websocket.send(msg)
+
+    async def _send_put_some(self, filename, groups, items):
+        self.message_id += 1
+        msg = encode_put_some(self.message_id, filename, groups, items)
         await self.websocket.send(msg)

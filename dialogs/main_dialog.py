@@ -12,7 +12,7 @@ import c4d
 import math
 from c4d import gui
 from modules.threading_bridge import EventType, BridgeEvent
-from modules.protocol import FacetShapeType
+from modules.protocol import FacetShapeType, MessageType
 
 PLUGIN_ID = 1066929
 
@@ -122,13 +122,14 @@ class PlasticityDialog(gui.GeDialog):
         bridge.register_callback(EventType.LIST_RESPONSE,    self._on_operation_complete)
         bridge.register_callback(EventType.REFACET_RESPONSE, self._on_operation_complete)
         bridge.register_callback(EventType.STATUS_UPDATE,    self._on_status_update)
+        # v2.1.0
+        bridge.register_callback(EventType.PUT_SOME_RESPONSE, self._on_operation_complete)
 
     # =========================================================================
     # Layout
     # =========================================================================
 
-    # Fixed width for all left-column labels — ensures the right column
-    # (inputs, toggles, buttons) starts at the same x-position throughout.
+    # Fixed width for all left-column labels
     LABEL_W = 160
 
     def CreateLayout(self):
@@ -169,7 +170,7 @@ class PlasticityDialog(gui.GeDialog):
                     self.AddEditText(IDS.EDT_SERVER, c4d.BFH_SCALEFIT)
                 self.GroupEnd()
 
-                # Connect / Disconnect — spacer + 2 buttons
+                # Connect / Disconnect
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
@@ -317,7 +318,7 @@ class PlasticityDialog(gui.GeDialog):
 
                 self.AddSeparatorH(c4d.BFH_SCALEFIT)
 
-                # Refacet Selected — spacer + button
+                # Refacet Selected
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 2, 4, 4)
@@ -439,7 +440,6 @@ class PlasticityDialog(gui.GeDialog):
     # =========================================================================
 
     def _sync_tab_visibility(self):
-        """Show / hide the three content groups to match the QuickTab state."""
         if not self._quicktab:
             return
 
@@ -454,7 +454,6 @@ class PlasticityDialog(gui.GeDialog):
         self.LayoutChanged(IDS.GRP_MAIN)
 
     def _sync_refacet_options(self):
-        """Show Simple or Advanced options based on the Refacet Options toggle."""
         if self._toggle_refacet:
             self._advanced_mode = self._toggle_refacet.IsSelected(1)
         self.HideElement(IDS.GRP_SIMPLE_OPTIONS,   self._advanced_mode)
@@ -489,16 +488,43 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_DISCONNECT:
             self.client.disconnect()
 
-        # ── Refresh ──────────────────────────────────────────────────────
+        # ── Refresh (v2.1.0: triggers PutSome after list completes) ──────
         elif id == IDS.BTN_REFRESH:
             if self._busy:
                 return True
             self._busy = True
             self._only_visible = self.GetBool(IDS.CHK_ONLY_VISIBLE)
+
+            # Capture local refs for the closure
+            client  = self.client
+            handler = self.handler
+            only_visible = self._only_visible
+
+            def on_complete(filename):
+                """Called on the main thread after the list response is processed."""
+                if not client.supports(MessageType.PUT_SOME_1):
+                    return
+
+                outbox_data = handler.get_outbox_data(filename, only_visible)
+                if not outbox_data["groups"] and not outbox_data["items"]:
+                    return
+
+                # Use the C4D document filename, or fall back
+                doc = c4d.documents.GetActiveDocument()
+                c4d_filename = "Untitled.c4d"
+                if doc:
+                    name = doc.GetDocumentName()
+                    if name:
+                        c4d_filename = name
+
+                client.put_some(c4d_filename,
+                                outbox_data["groups"],
+                                outbox_data["items"])
+
             if self._only_visible:
-                self.client.list_visible()
+                self.client.list_visible(on_complete)
             else:
-                self.client.list_all()
+                self.client.list_all(on_complete)
 
         # ── Live Link ────────────────────────────────────────────────────
         elif id == IDS.CHK_LIVELINK:
