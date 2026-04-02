@@ -68,8 +68,8 @@ class IDS:
     # Utilities tab
     BTN_STORE_FACES      = 1901
     BTN_STORE_EDGES      = 1902
-    BTN_MARK_SHARP       = 1903
-    CHK_SMART_EDGES      = 1905
+    BTN_SELECT_SHARP     = 1903
+    EDT_SHARP_ANGLE      = 1905
     BTN_SELECT_FACE      = 1906
     BTN_SELECT_EDGE      = 1907
 
@@ -365,18 +365,23 @@ class PlasticityDialog(gui.GeDialog):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
                     self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
-                                       name="Mark")
-                    self.AddButton(IDS.BTN_MARK_SHARP, c4d.BFH_SCALEFIT,
-                                   name="Mark Sharp Edges (PhongBreak)")
+                                       name="Sharp")
+                    self.AddButton(IDS.BTN_SELECT_SHARP,
+                                   c4d.BFH_SCALEFIT,
+                                   name="Select Sharp Edges")
                 self.GroupEnd()
 
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
-                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
-                    self.AddCheckbox(IDS.CHK_SMART_EDGES, c4d.BFH_LEFT,
-                                     initw=0, inith=0,
-                                     name="Smart Edge Marking")
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
+                                       name="")
+                    if self.GroupBegin(0, c4d.BFH_LEFT, 2, 0):
+                        self.GroupSpace(4, 0)
+                        self.AddStaticText(0, c4d.BFH_LEFT, name="Angle")
+                        self.AddEditNumberArrows(IDS.EDT_SHARP_ANGLE,
+                                           c4d.BFH_LEFT, initw=80)
+                    self.GroupEnd()
                 self.GroupEnd()
 
             self.GroupEnd()  # GRP_TAB_UTILITIES
@@ -424,6 +429,11 @@ class PlasticityDialog(gui.GeDialog):
         self.SetFloat(IDS.SLD_UNIT_SCALE, self._unit_scale,
                       min=0.0001, max=100.0, step=0.01,
                       format=c4d.FORMAT_FLOAT)
+
+        # Sharp edge angle (degrees)
+        self.SetFloat(IDS.EDT_SHARP_ANGLE, 0.0,
+                      min=0.0, max=math.pi, step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Refacet options: show Simple group, hide Advanced group by default
         self._sync_refacet_options()
@@ -567,8 +577,8 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_SELECT_EDGE:
             self._do_select_plasticity_edges()
 
-        elif id == IDS.BTN_MARK_SHARP:
-            self._do_mark_sharp_edges()
+        elif id == IDS.BTN_SELECT_SHARP:
+            self._do_select_sharp_edges()
 
         return True
 
@@ -603,8 +613,8 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.BTN_STORE_EDGES, connected and not self._busy)
         self.Enable(IDS.BTN_SELECT_FACE, connected and not self._busy and in_poly_mode)
         self.Enable(IDS.BTN_SELECT_EDGE, connected and not self._busy and in_poly_mode)
-        self.Enable(IDS.BTN_MARK_SHARP,  connected and not self._busy)
-        self.Enable(IDS.CHK_SMART_EDGES, connected)
+        self.Enable(IDS.BTN_SELECT_SHARP, connected and not self._busy)
+        self.Enable(IDS.EDT_SHARP_ANGLE, connected)
 
         status = self.bridge.status_message
         self.SetString(IDS.LBL_STATUS,   f"Status: {status}")
@@ -752,15 +762,15 @@ class PlasticityDialog(gui.GeDialog):
                 "Select one or more polygons on a Plasticity object first.")
 
     # =========================================================================
-    # Auto Mark Edges
+    # Select Sharp Edges
     # =========================================================================
 
-    def _do_mark_sharp_edges(self):
+    def _do_select_sharp_edges(self):
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return
-        smart    = self.GetBool(IDS.CHK_SMART_EDGES)
-        affected = self.handler.apply_phong_breaks(doc, smart=smart)
+        angle_deg = math.degrees(self.GetFloat(IDS.EDT_SHARP_ANGLE))
+        affected = self.handler.select_sharp_edges(doc, angle_deg=angle_deg)
         if not affected:
             gui.MessageDialog(
                 "No Plasticity objects selected.\n"

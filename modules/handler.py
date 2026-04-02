@@ -2219,7 +2219,7 @@ class SceneHandler:
         return n / length if length > 1e-12 else c4d.Vector(0.0, 1.0, 0.0)
 
     @staticmethod
-    def _get_sharp_edge_addresses(obj, smart):
+    def _get_sharp_edge_addresses(obj, angle_deg=0.0):
         result = _get_poly_face_map_only(obj)
         if result is None:
             return []
@@ -2227,12 +2227,13 @@ class SceneHandler:
 
         edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
-        if smart:
+        use_angle_filter = angle_deg > 0.0
+        if use_angle_filter:
             poly_normals = [
                 SceneHandler._poly_geometric_normal(obj, obj.GetPolygon(pi))
                 for pi in range(poly_count)
             ]
-            _COS_THRESHOLD = math.cos(math.radians(5.0))
+            cos_threshold = math.cos(math.radians(angle_deg))
 
         addresses = []
         for occurrences in edge_map.values():
@@ -2246,10 +2247,10 @@ class SceneHandler:
                 if g0 == g1:
                     continue
 
-                if smart:
+                if use_angle_filter:
                     pi0 = occurrences[0][0]
                     pi1 = occurrences[1][0]
-                    if poly_normals[pi0].Dot(poly_normals[pi1]) >= _COS_THRESHOLD:
+                    if poly_normals[pi0].Dot(poly_normals[pi1]) >= cos_threshold:
                         continue
 
                 poly_idx, slot, _ = occurrences[0]
@@ -2258,48 +2259,40 @@ class SceneHandler:
         return addresses
 
     # -------------------------------------------------------------------------
-    # Mark Sharp (Phong Breaks)
+    # Select Sharp Edges
     # -------------------------------------------------------------------------
 
-    def apply_phong_breaks(self, doc, smart=False):
-        """Apply Phong Breaks to sharp Plasticity edges on selected objects."""
+    def select_sharp_edges(self, doc, angle_deg=0.0):
+        """Select Plasticity boundary edges, optionally filtered by angle."""
         if not doc:
             return False
 
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
-        affected  = 0
+        affected = 0
 
         for obj in selection:
-            if self._apply_phong_breaks_to_obj(doc, obj, smart):
+            if self._select_sharp_edges_on_obj(obj, angle_deg):
                 affected += 1
 
-        c4d.EventAdd()
+        if affected:
+            doc.SetMode(c4d.Medges)
+            c4d.EventAdd()
+
         return affected > 0
 
-    def _apply_phong_breaks_to_obj(self, doc, obj, smart):
+    def _select_sharp_edges_on_obj(self, obj, angle_deg):
         if not obj.CheckType(c4d.Opolygon):
             return False
 
-        addresses = self._get_sharp_edge_addresses(obj, smart)
+        addresses = self._get_sharp_edge_addresses(obj, angle_deg)
         if not addresses:
             return False
 
         edge_sel = obj.GetEdgeS()
-        prev_sel = edge_sel.GetClone()
-
         edge_sel.DeselectAll()
         for poly_idx, slot in addresses:
             edge_sel.Select(poly_idx * 4 + slot)
 
-        c4d.utils.SendModelingCommand(
-            command=c4d.MCOMMAND_SETPHONGBREAKS,
-            list=[obj],
-            mode=c4d.MODELINGCOMMANDMODE_EDGESELECTION,
-            bc=c4d.BaseContainer(),
-            doc=doc,
-        )
-
-        edge_sel.CopyTo(prev_sel) if prev_sel else edge_sel.DeselectAll()
         obj.Message(c4d.MSG_UPDATE)
         return True
 
