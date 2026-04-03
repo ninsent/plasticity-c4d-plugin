@@ -4,6 +4,27 @@ All notable changes to Plasticity Cinema 4D Bridge will be documented in this fi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
+## [1.1.0] - 2026-04-03
+
+### Added
+- **Handshake protocol** — client sends `HANDSHAKE_1` on connect; server responds with supported message types for capability negotiation
+- **Inbox / Outbox hierarchy** — root null now contains an Inbox (incoming Plasticity objects) and an Outbox (user-created SDS objects for upload); objects in the Outbox are protected from incoming updates
+- **PutSome upload** — SDS objects placed in the Outbox are uploaded to Plasticity via `PUT_SOME_1` on Refresh (when the server supports it); control-cage resolution supports single polygon children (fast path), cache-based generator resolution, and CSTO fallback
+- **Auto-Refacet tag** — custom `TagData` plugin (`Plasticity Auto-Refacet`) that stores refacet settings per object; tagged objects are automatically re-tessellated after every refresh or live-link geometry update
+- **Auto-Refacet checkbox** — in the Basic tab below the Refacet button; when checked, clicking Refacet Selected stamps the tag on selected objects with current dialog settings
+- Auto-refacet batching — objects with identical tag settings are grouped into a single `refacet_some` server request
+- Legacy scene migration — objects from pre-1.1.0 scenes (directly under root) are detected and re-parented into Inbox on refresh
+
+### Changed
+- **Select Sharp Edges** — selects all Plasticity boundary edges on selected objects and switches to edge mode; replaces the former Mark Sharp (PhongBreak) feature
+- **Angle threshold** — compact degree input field below the Select Sharp Edges button; filters edge selection to only include edges sharper than the specified dihedral angle (0° = all boundary edges)
+- Scene hierarchy restructured from flat root children to Inbox/Outbox sub-nulls
+- `_process_objects` now accepts `outbox_ids` set to skip protected objects during list/transaction processing
+
+### Removed
+- **Mark Sharp Edges (PhongBreak)** — replaced by Select Sharp Edges with angle threshold
+- **Smart Edge Marking checkbox** — replaced by the angle input field
+
 ## [1.0.0] - 2026-03-27
 
 ### Added
