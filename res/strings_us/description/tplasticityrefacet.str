@@ -1,0 +1,25 @@
+STRINGTABLE Tplasticityrefacet
+{
+    Tplasticityrefacet          "Plasticity Auto-Refacet";
+
+    PLASTICITYREFACET_TOPOLOGY              "Topology";
+    PLASTICITYREFACET_TOPOLOGY_TRIS         "Tris";
+    PLASTICITYREFACET_TOPOLOGY_NGONS        "Ngons";
+
+    PLASTICITYREFACET_OPTIONS_MODE          "Refacet Options";
+    PLASTICITYREFACET_OPTIONS_SIMPLE        "Simple";
+    PLASTICITYREFACET_OPTIONS_ADVANCED      "Advanced";
+
+    PLASTICITYREFACET_TOLERANCE             "Tolerance";
+    PLASTICITYREFACET_ANGLE                 "Angle";
+
+    PLASTICITYREFACET_MIN_WIDTH             "Min Width";
+    PLASTICITYREFACET_MAX_WIDTH             "Max Width";
+    PLASTICITYREFACET_CURVE_CHORD_TOL       "Edge Chord Tol";
+    PLASTICITYREFACET_CURVE_CHORD_ANG       "Edge Chord Angle";
+    PLASTICITYREFACET_SURF_PLANE_TOL        "Face Plane Tol";
+    PLASTICITYREFACET_SURF_ANGLE_TOL        "Face Angle Tol";
+
+    PLASTICITYREFACET_GRP_SIMPLE            "Simple";
+    PLASTICITYREFACET_GRP_ADVANCED          "Advanced";
+}

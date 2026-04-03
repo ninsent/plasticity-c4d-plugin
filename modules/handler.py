@@ -66,6 +66,7 @@ from typing import Dict, List, Optional, Any, Set, Tuple
 
 from modules.protocol import ObjectType, MessageType
 from modules.threading_bridge import ThreadingBridge, BridgeEvent, EventType
+from modules.refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
 
 # BaseContainer keys — offsets from registered plugin ID 1066929
 PLUGIN_ID              = 1066929
@@ -506,6 +507,9 @@ class SceneHandler:
             self.client.on_list_complete = None
             callback(filename)
 
+        # Auto-refacet objects that carry the refacet tag
+        self._auto_refacet_tagged(doc, filename, all_item_ids)
+
     def _on_transaction(self, event: BridgeEvent):
         """Incremental live-link update."""
         data = event.data
@@ -539,6 +543,16 @@ class SceneHandler:
 
         self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
+
+        # Auto-refacet objects that carry the refacet tag
+        if all_objects:
+            updated_ids = set()
+            for obj_data in all_objects:
+                ot  = int(obj_data.get('type', -1))
+                oid = obj_data.get('id', 0)
+                if ot in (ObjectType.SOLID, ObjectType.SHEET):
+                    updated_ids.add(oid)
+            self._auto_refacet_tagged(doc, filename, updated_ids)
 
     def _on_refacet_response(self, event: BridgeEvent):
         """Re-tessellate objects with new facet settings."""
@@ -690,6 +704,54 @@ class SceneHandler:
                 obj = obj.GetNext()
             return None
         return _search(doc.GetFirstObject())
+
+    # =========================================================================
+    # Auto-refacet: trigger refacet for tagged objects after geometry updates
+    # =========================================================================
+
+    def _auto_refacet_tagged(self, doc, filename, updated_item_ids):
+        """Send refacet requests for updated objects that carry the auto-refacet tag.
+
+        Called from _on_list_response and _on_transaction — NEVER from
+        _on_refacet_response (to avoid infinite loops).
+        """
+        if not self.client or not self.client.connected:
+            return
+        if not updated_item_ids:
+            return
+
+        # Group objects by identical refacet settings so we can batch them
+        # into as few server requests as possible.
+        settings_groups = {}  # settings_key → (kwargs, [plasticity_ids])
+
+        for obj_id in updated_item_ids:
+            key = (filename, obj_id)
+            obj = self._items.get(key)
+            if not obj or obj.GetDocument() != doc:
+                continue
+
+            tag = obj.GetTag(REFACET_TAG_ID)
+            if not tag:
+                continue
+
+            try:
+                kwargs = read_tag_refacet_kwargs(tag)
+            except Exception as e:
+                print(f"[Plasticity] Error reading refacet tag on "
+                      f"'{obj.GetName()}': {e}")
+                continue
+
+            # Build a hashable key from the settings dict
+            settings_key = tuple(sorted(kwargs.items()))
+
+            if settings_key not in settings_groups:
+                settings_groups[settings_key] = (kwargs, [])
+            settings_groups[settings_key][1].append(obj_id)
+
+        # Send one refacet_some per unique settings group
+        for kwargs, obj_ids in settings_groups.values():
+            self.client.refacet_some(
+                filename=filename, plasticity_ids=obj_ids, **kwargs)
 
     # =========================================================================
     # Cache management

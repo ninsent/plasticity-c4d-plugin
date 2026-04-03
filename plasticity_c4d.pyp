@@ -23,6 +23,10 @@ libs_path = os.path.join(plugin_dir, "libs")
 if libs_path not in sys.path:
     sys.path.insert(0, libs_path)
 
+# Resource handler for description files (required by RegisterTagPlugin)
+__res__ = c4d.plugins.GeResource()
+__res__.Init(plugin_dir)
+
 # Now try to import modules with error handling
 try:
     from modules.client import PlasticityClient
@@ -137,3 +141,13 @@ if __name__ == "__main__":
         print("[Plasticity Bridge] Plugin registered successfully (ID: 1066929)")
     else:
         print("[Plasticity Bridge] Failed to register plugin")
+
+    # Register the auto-refacet tag plugin
+    if IMPORT_SUCCESS:
+        try:
+            from modules.refacet_tag import register_refacet_tag
+            register_refacet_tag(icon, __res__)
+        except Exception as e:
+            print(f"[Plasticity Bridge] Failed to register refacet tag: {e}")
+            import traceback
+            traceback.print_exc()

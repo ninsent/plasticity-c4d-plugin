@@ -13,6 +13,15 @@ import math
 from c4d import gui
 from modules.threading_bridge import EventType, BridgeEvent
 from modules.protocol import FacetShapeType, MessageType
+from modules.refacet_tag import (
+    TAG_PLUGIN_ID as REFACET_TAG_ID,
+    PREF_TOPOLOGY, PREF_TOPOLOGY_TRIS, PREF_TOPOLOGY_NGONS,
+    PREF_OPTIONS_MODE, PREF_OPTIONS_SIMPLE, PREF_OPTIONS_ADVANCED,
+    PREF_TOLERANCE, PREF_ANGLE,
+    PREF_MIN_WIDTH, PREF_MAX_WIDTH,
+    PREF_CURVE_CHORD_TOL, PREF_CURVE_CHORD_ANG,
+    PREF_SURF_PLANE_TOL, PREF_SURF_ANGLE_TOL,
+)
 
 PLUGIN_ID = 1066929
 
@@ -64,6 +73,7 @@ class IDS:
     SLD_SURF_PLANE_TOL   = 1604
     SLD_SURF_ANGLE_TOL   = 1605
     BTN_REFACET          = 1700
+    CHK_AUTO_REFACET     = 1701
 
     # Utilities tab
     BTN_STORE_FACES      = 1901
@@ -327,6 +337,15 @@ class PlasticityDialog(gui.GeDialog):
                                    name="Refacet Selected")
                 self.GroupEnd()
 
+                # Auto-Refacet
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 0, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
+                    self.AddCheckbox(IDS.CHK_AUTO_REFACET, c4d.BFH_LEFT,
+                                     initw=0, inith=0, name="Auto-Refacet")
+                self.GroupEnd()
+
             self.GroupEnd()  # GRP_TAB_BASIC
 
             # ── Tab: Utilities ───────────────────────────────────────────
@@ -429,6 +448,9 @@ class PlasticityDialog(gui.GeDialog):
         self.SetFloat(IDS.SLD_UNIT_SCALE, self._unit_scale,
                       min=0.0001, max=100.0, step=0.01,
                       format=c4d.FORMAT_FLOAT)
+
+        # Auto-Refacet checkbox
+        self.SetBool(IDS.CHK_AUTO_REFACET, False)
 
         # Sharp edge angle (degrees)
         self.SetFloat(IDS.EDT_SHARP_ANGLE, 0.0,
@@ -597,6 +619,7 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.SLD_UNIT_SCALE, connected)
         self.Enable(IDS.CHK_ONLY_VISIBLE, connected)
         self.Enable(IDS.BTN_REFACET,    connected and not self._busy)
+        self.Enable(IDS.CHK_AUTO_REFACET, connected)
         self.Enable(IDS.TOGGLE_TOPOLOGY,     connected)
         self.Enable(IDS.TOGGLE_REFACET_OPTS, connected)
         self.Enable(IDS.SLD_TOLERANCE,       connected)
@@ -708,6 +731,57 @@ class PlasticityDialog(gui.GeDialog):
                 curve_chord_max       = curve_chord_max,
                 shape                 = FacetShapeType.CUT,
             )
+
+        # ── Auto-Refacet tag creation / update ───────────────────────────
+        if self.GetBool(IDS.CHK_AUTO_REFACET):
+            self._stamp_auto_refacet_tags(doc, ids, tolerance, angle,
+                                          min_width, max_width, cct, cca,
+                                          spt, spa)
+
+    def _stamp_auto_refacet_tags(self, doc, ids, tolerance, angle,
+                                 min_width, max_width, cct, cca, spt, spa):
+        """Create or update auto-refacet tags on the selected Plasticity objects."""
+        from modules.handler import BC_PLASTICITY_ID, BC_PLASTICITY_FILENAME
+
+        doc.StartUndo()
+        try:
+            for filename, obj_id in ids:
+                # Find the C4D object via the handler's cache
+                key = (filename, obj_id)
+                obj = self.handler._items.get(key)
+                if not obj or obj.GetDocument() != doc:
+                    continue
+
+                # Find existing auto-refacet tag or create a new one
+                tag = obj.GetTag(REFACET_TAG_ID)
+                if tag:
+                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+                else:
+                    tag = c4d.BaseTag(REFACET_TAG_ID)
+                    if not tag:
+                        continue
+                    obj.InsertTag(tag)
+                    doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, tag)
+
+                # Write current dialog settings into the tag
+                tag[PREF_TOPOLOGY] = (PREF_TOPOLOGY_TRIS
+                                      if self._tri_mode
+                                      else PREF_TOPOLOGY_NGONS)
+                tag[PREF_OPTIONS_MODE] = (PREF_OPTIONS_ADVANCED
+                                          if self._advanced_mode
+                                          else PREF_OPTIONS_SIMPLE)
+                tag[PREF_TOLERANCE]       = tolerance
+                tag[PREF_ANGLE]           = angle
+                tag[PREF_MIN_WIDTH]       = min_width
+                tag[PREF_MAX_WIDTH]       = max_width
+                tag[PREF_CURVE_CHORD_TOL] = cct
+                tag[PREF_CURVE_CHORD_ANG] = cca
+                tag[PREF_SURF_PLANE_TOL]  = spt
+                tag[PREF_SURF_ANGLE_TOL]  = spa
+        finally:
+            doc.EndUndo()
+
+        c4d.EventAdd()
 
     # =========================================================================
     # Store Plasticity Faces
