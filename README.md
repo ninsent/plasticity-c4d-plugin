@@ -217,7 +217,7 @@ Check the [CHANGELOG.md](CHANGELOG.md) for a detailed history of changes.
 
 **Nursultan Akim**
 
-- Portfolio: [bento.me/ninsent](https://behance.net/ninsent)
+- Portfolio: [behance.net/ninsent](https://behance.net/ninsent)
 
 ---
 
