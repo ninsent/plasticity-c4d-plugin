@@ -30,6 +30,10 @@ class MessageType(IntEnum):
     UNSUBSCRIBE_ALL_1 = 25
     REFACET_SOME_1 = 26
 
+    PUT_SOME_1 = 31
+
+    HANDSHAKE_1 = 100
+
 
 class ObjectType(IntEnum):
     SOLID = 0
@@ -109,6 +113,61 @@ def encode_refacet_some(
                 min_width, max_width, curve_chord_max,
                 shape.value,
             ))
+
+
+def encode_handshake(message_id: int) -> bytes:
+    """Encode a HANDSHAKE_1 message (client -> server)."""
+    return struct.pack("<II", MessageType.HANDSHAKE_1, message_id)
+
+
+def encode_put_some(message_id: int, filename: str,
+                    groups: List[Dict], items: List[Dict]) -> bytes:
+    """Encode a PUT_SOME_1 message (client -> server).
+
+    groups: list of dicts with keys:
+        c4d_collection_id, name, parent_c4d_collection_id, existing_group_id
+    items: list of dicts with keys:
+        c4d_id, name, parent_c4d_collection_id, existing_stable_id,
+        options (uint64), positions (flat float list),
+        indices (flat uint32 list), sizes (uint32 list of face vertex counts)
+    """
+    msg = struct.pack("<II", MessageType.PUT_SOME_1, message_id)
+
+    # Filename
+    msg += _encode_string(filename)
+
+    # Groups
+    msg += struct.pack("<I", len(groups))
+    for g in groups:
+        msg += _encode_string(g["c4d_collection_id"])
+        msg += _encode_string(g["name"])
+        msg += _encode_string(g["parent_c4d_collection_id"])
+        msg += struct.pack("<I", g.get("existing_group_id", 0))
+
+    # Items
+    msg += struct.pack("<I", len(items))
+    for item in items:
+        msg += _encode_string(item["c4d_id"])
+        msg += _encode_string(item["name"])
+        msg += _encode_string(item["parent_c4d_collection_id"])
+        msg += struct.pack("<I", item.get("existing_stable_id", 0))
+        msg += struct.pack("<Q", item["options"])  # uint64
+
+        positions = item["positions"]
+        vertex_count = len(positions) // 3
+        msg += struct.pack("<I", vertex_count)
+        msg += struct.pack(f"<{len(positions)}f", *positions)
+
+        indices = item["indices"]
+        sizes = item["sizes"]
+        face_count = len(sizes)
+        index_count = len(indices)
+        msg += struct.pack("<I", face_count)
+        msg += struct.pack("<I", index_count)
+        msg += struct.pack(f"<{index_count}I", *indices)
+        msg += struct.pack(f"<{face_count}I", *sizes)
+
+    return msg
 
 
 # =============================================================================
@@ -258,7 +317,6 @@ class MessageParser:
             return None
 
         if message_type == MessageType.TRANSACTION_1:
-            # Transaction has no message_id — goes straight to filename
             return self._parse_transaction(view, offset, message_type)
 
         elif message_type in (MessageType.LIST_ALL_1, MessageType.LIST_SOME_1,
@@ -268,7 +326,6 @@ class MessageParser:
             if code != 200:
                 print(f"[Protocol] List failed with code: {code}")
                 return None
-            # LIST response wraps a transaction-like structure
             return self._parse_transaction(view, offset, message_type)
 
         elif message_type == MessageType.REFACET_SOME_1:
@@ -280,6 +337,12 @@ class MessageParser:
 
         elif message_type == MessageType.NEW_FILE_1:
             return self._parse_new_file(view, offset)
+
+        elif message_type == MessageType.HANDSHAKE_1:
+            return self._parse_handshake(view, offset)
+
+        elif message_type == MessageType.PUT_SOME_1:
+            return self._parse_put_some(view, offset)
 
         else:
             print(f"[Protocol] Unhandled message type: {message_type}")
@@ -345,27 +408,21 @@ class MessageParser:
             plasticity_id, offset = _read_u32(view, offset)
             version, offset = _read_u32(view, offset)
 
-            # Face facets (ngon face assignments)
             num_faces, offset = _read_u32(view, offset)
             faces, offset = _read_int_array(view, offset, num_faces)
 
-            # Positions (vertices as flat float array)
             num_positions, offset = _read_u32(view, offset)
             vertices, offset = _read_float_array(view, offset, num_positions)
 
-            # Indices
             num_indices, offset = _read_u32(view, offset)
             indices, offset = _read_int_array(view, offset, num_indices)
 
-            # Normals
             num_normals, offset = _read_u32(view, offset)
             normals, offset = _read_float_array(view, offset, num_normals)
 
-            # Groups
             num_groups, offset = _read_u32(view, offset)
             groups, offset = _read_int_array(view, offset, num_groups)
 
-            # Face IDs
             num_face_ids, offset = _read_u32(view, offset)
             face_ids, offset = _read_int_array(view, offset, num_face_ids)
 
@@ -381,7 +438,6 @@ class MessageParser:
         }
 
     def _parse_new_version(self, view, offset):
-        """Parse NEW_VERSION_1 message."""
         filename, offset = _read_string(view, offset)
         version, offset = _read_u32(view, offset)
         return {
@@ -390,9 +446,59 @@ class MessageParser:
         }
 
     def _parse_new_file(self, view, offset):
-        """Parse NEW_FILE_1 message."""
         filename, offset = _read_string(view, offset)
         return {
             'type': MessageType.NEW_FILE_1,
             'filename': filename,
+        }
+
+    def _parse_handshake(self, view, offset):
+        """Parse HANDSHAKE_1 response (server -> client)."""
+        message_id, offset = _read_u32(view, offset)
+        num_messages, offset = _read_u32(view, offset)
+
+        supported = set()
+        for _ in range(num_messages):
+            msg_type, offset = _read_u32(view, offset)
+            supported.add(msg_type)
+
+        return {
+            'type': MessageType.HANDSHAKE_1,
+            'message_id': message_id,
+            'supported_messages': supported,
+        }
+
+    def _parse_put_some(self, view, offset):
+        """Parse PUT_SOME_1 response (server -> client)."""
+        message_id, offset = _read_u32(view, offset)
+        code, offset = _read_u32(view, offset)
+
+        num_groups, offset = _read_u32(view, offset)
+        group_results = []
+        for _ in range(num_groups):
+            collection_id, offset = _read_string(view, offset)
+            group_id, offset = _read_u32(view, offset)
+            group_results.append({
+                "c4d_collection_id": collection_id,
+                "group_id": group_id,
+            })
+
+        num_items, offset = _read_u32(view, offset)
+        item_results = []
+        for _ in range(num_items):
+            c4d_id, offset = _read_string(view, offset)
+            stable_id, offset = _read_u32(view, offset)
+            version_id, offset = _read_u32(view, offset)
+            item_results.append({
+                "c4d_id": c4d_id,
+                "stable_id": stable_id,
+                "version_id": version_id,
+            })
+
+        return {
+            'type': MessageType.PUT_SOME_1,
+            'message_id': message_id,
+            'code': code,
+            'group_results': group_results,
+            'item_results': item_results,
         }

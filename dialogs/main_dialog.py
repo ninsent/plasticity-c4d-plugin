@@ -12,7 +12,16 @@ import c4d
 import math
 from c4d import gui
 from modules.threading_bridge import EventType, BridgeEvent
-from modules.protocol import FacetShapeType
+from modules.protocol import FacetShapeType, MessageType
+from modules.refacet_tag import (
+    TAG_PLUGIN_ID as REFACET_TAG_ID,
+    PREF_TOPOLOGY, PREF_TOPOLOGY_TRIS, PREF_TOPOLOGY_NGONS,
+    PREF_OPTIONS_MODE, PREF_OPTIONS_SIMPLE, PREF_OPTIONS_ADVANCED,
+    PREF_TOLERANCE, PREF_ANGLE,
+    PREF_MIN_WIDTH, PREF_MAX_WIDTH,
+    PREF_CURVE_CHORD_TOL, PREF_CURVE_CHORD_ANG,
+    PREF_SURF_PLANE_TOL, PREF_SURF_ANGLE_TOL,
+)
 
 PLUGIN_ID = 1066929
 
@@ -64,12 +73,13 @@ class IDS:
     SLD_SURF_PLANE_TOL   = 1604
     SLD_SURF_ANGLE_TOL   = 1605
     BTN_REFACET          = 1700
+    CHK_AUTO_REFACET     = 1701
 
     # Utilities tab
     BTN_STORE_FACES      = 1901
     BTN_STORE_EDGES      = 1902
-    BTN_MARK_SHARP       = 1903
-    CHK_SMART_EDGES      = 1905
+    BTN_SELECT_SHARP     = 1903
+    EDT_SHARP_ANGLE      = 1905
     BTN_SELECT_FACE      = 1906
     BTN_SELECT_EDGE      = 1907
 
@@ -98,13 +108,13 @@ class PlasticityDialog(gui.GeDialog):
         self._tri_mode          = True
         self._advanced_mode     = False
         self._tolerance         = 0.01
-        self._angle             = 0.45
+        self._angle             = math.radians(25.0)
         self._min_width         = 0.0
         self._max_width         = 0.0
         self._curve_chord_tol   = 0.01
-        self._curve_chord_angle = 0.35
+        self._curve_chord_angle = math.radians(20.0)
         self._surface_plane_tol = 0.01
-        self._surface_angle_tol = 0.35
+        self._surface_angle_tol = math.radians(20.0)
         self._unit_scale        = 1.0
         self._busy              = False
 
@@ -122,13 +132,14 @@ class PlasticityDialog(gui.GeDialog):
         bridge.register_callback(EventType.LIST_RESPONSE,    self._on_operation_complete)
         bridge.register_callback(EventType.REFACET_RESPONSE, self._on_operation_complete)
         bridge.register_callback(EventType.STATUS_UPDATE,    self._on_status_update)
+        # v2.1.0
+        bridge.register_callback(EventType.PUT_SOME_RESPONSE, self._on_operation_complete)
 
     # =========================================================================
     # Layout
     # =========================================================================
 
-    # Fixed width for all left-column labels — ensures the right column
-    # (inputs, toggles, buttons) starts at the same x-position throughout.
+    # Fixed width for all left-column labels
     LABEL_W = 160
 
     def CreateLayout(self):
@@ -169,7 +180,7 @@ class PlasticityDialog(gui.GeDialog):
                     self.AddEditText(IDS.EDT_SERVER, c4d.BFH_SCALEFIT)
                 self.GroupEnd()
 
-                # Connect / Disconnect — spacer + 2 buttons
+                # Connect / Disconnect
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
@@ -317,13 +328,22 @@ class PlasticityDialog(gui.GeDialog):
 
                 self.AddSeparatorH(c4d.BFH_SCALEFIT)
 
-                # Refacet Selected — spacer + button
+                # Refacet Selected
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 2, 4, 4)
                     self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
                     self.AddButton(IDS.BTN_REFACET, c4d.BFH_SCALEFIT,
                                    name="Refacet Selected")
+                self.GroupEnd()
+
+                # Auto-Refacet
+                if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
+                    self.GroupSpace(8, 0)
+                    self.GroupBorderSpace(4, 0, 4, 4)
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
+                    self.AddCheckbox(IDS.CHK_AUTO_REFACET, c4d.BFH_LEFT,
+                                     initw=0, inith=0, name="Auto-Refacet")
                 self.GroupEnd()
 
             self.GroupEnd()  # GRP_TAB_BASIC
@@ -364,18 +384,23 @@ class PlasticityDialog(gui.GeDialog):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
                     self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
-                                       name="Mark")
-                    self.AddButton(IDS.BTN_MARK_SHARP, c4d.BFH_SCALEFIT,
-                                   name="Mark Sharp Edges (PhongBreak)")
+                                       name="Sharp")
+                    self.AddButton(IDS.BTN_SELECT_SHARP,
+                                   c4d.BFH_SCALEFIT,
+                                   name="Select Sharp Edges")
                 self.GroupEnd()
 
                 if self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0):
                     self.GroupSpace(8, 0)
                     self.GroupBorderSpace(4, 0, 4, 4)
-                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW, name="")
-                    self.AddCheckbox(IDS.CHK_SMART_EDGES, c4d.BFH_LEFT,
-                                     initw=0, inith=0,
-                                     name="Smart Edge Marking")
+                    self.AddStaticText(0, c4d.BFH_LEFT, initw=LW,
+                                       name="")
+                    if self.GroupBegin(0, c4d.BFH_LEFT, 2, 0):
+                        self.GroupSpace(4, 0)
+                        self.AddStaticText(0, c4d.BFH_LEFT, name="Angle")
+                        self.AddEditNumberArrows(IDS.EDT_SHARP_ANGLE,
+                                           c4d.BFH_LEFT, initw=80)
+                    self.GroupEnd()
                 self.GroupEnd()
 
             self.GroupEnd()  # GRP_TAB_UTILITIES
@@ -396,8 +421,9 @@ class PlasticityDialog(gui.GeDialog):
                       min=0.0001, max=0.1, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_ANGLE, self._angle,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Advanced sliders
         self.SetFloat(IDS.SLD_MIN_WIDTH, self._min_width,
@@ -410,19 +436,29 @@ class PlasticityDialog(gui.GeDialog):
                       min=0.0001, max=1.0, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_CURVE_CHORD_ANG, self._curve_chord_angle,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
         self.SetFloat(IDS.SLD_SURF_PLANE_TOL, self._surface_plane_tol,
                       min=0.0001, max=1.0, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_SURF_ANGLE_TOL, self._surface_angle_tol,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Unit scale
         self.SetFloat(IDS.SLD_UNIT_SCALE, self._unit_scale,
                       min=0.0001, max=100.0, step=0.01,
                       format=c4d.FORMAT_FLOAT)
+
+        # Auto-Refacet checkbox
+        self.SetBool(IDS.CHK_AUTO_REFACET, False)
+
+        # Sharp edge angle (degrees)
+        self.SetFloat(IDS.EDT_SHARP_ANGLE, 0.0,
+                      min=0.0, max=math.pi, step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Refacet options: show Simple group, hide Advanced group by default
         self._sync_refacet_options()
@@ -439,7 +475,6 @@ class PlasticityDialog(gui.GeDialog):
     # =========================================================================
 
     def _sync_tab_visibility(self):
-        """Show / hide the three content groups to match the QuickTab state."""
         if not self._quicktab:
             return
 
@@ -454,7 +489,6 @@ class PlasticityDialog(gui.GeDialog):
         self.LayoutChanged(IDS.GRP_MAIN)
 
     def _sync_refacet_options(self):
-        """Show Simple or Advanced options based on the Refacet Options toggle."""
         if self._toggle_refacet:
             self._advanced_mode = self._toggle_refacet.IsSelected(1)
         self.HideElement(IDS.GRP_SIMPLE_OPTIONS,   self._advanced_mode)
@@ -489,16 +523,43 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_DISCONNECT:
             self.client.disconnect()
 
-        # ── Refresh ──────────────────────────────────────────────────────
+        # ── Refresh (v2.1.0: triggers PutSome after list completes) ──────
         elif id == IDS.BTN_REFRESH:
             if self._busy:
                 return True
             self._busy = True
             self._only_visible = self.GetBool(IDS.CHK_ONLY_VISIBLE)
+
+            # Capture local refs for the closure
+            client  = self.client
+            handler = self.handler
+            only_visible = self._only_visible
+
+            def on_complete(filename):
+                """Called on the main thread after the list response is processed."""
+                if not client.supports(MessageType.PUT_SOME_1):
+                    return
+
+                outbox_data = handler.get_outbox_data(filename, only_visible)
+                if not outbox_data["groups"] and not outbox_data["items"]:
+                    return
+
+                # Use the C4D document filename, or fall back
+                doc = c4d.documents.GetActiveDocument()
+                c4d_filename = "Untitled.c4d"
+                if doc:
+                    name = doc.GetDocumentName()
+                    if name:
+                        c4d_filename = name
+
+                client.put_some(c4d_filename,
+                                outbox_data["groups"],
+                                outbox_data["items"])
+
             if self._only_visible:
-                self.client.list_visible()
+                self.client.list_visible(on_complete)
             else:
-                self.client.list_all()
+                self.client.list_all(on_complete)
 
         # ── Live Link ────────────────────────────────────────────────────
         elif id == IDS.CHK_LIVELINK:
@@ -541,8 +602,8 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_SELECT_EDGE:
             self._do_select_plasticity_edges()
 
-        elif id == IDS.BTN_MARK_SHARP:
-            self._do_mark_sharp_edges()
+        elif id == IDS.BTN_SELECT_SHARP:
+            self._do_select_sharp_edges()
 
         return True
 
@@ -561,6 +622,7 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.SLD_UNIT_SCALE, connected)
         self.Enable(IDS.CHK_ONLY_VISIBLE, connected)
         self.Enable(IDS.BTN_REFACET,    connected and not self._busy)
+        self.Enable(IDS.CHK_AUTO_REFACET, connected)
         self.Enable(IDS.TOGGLE_TOPOLOGY,     connected)
         self.Enable(IDS.TOGGLE_REFACET_OPTS, connected)
         self.Enable(IDS.SLD_TOLERANCE,       connected)
@@ -577,8 +639,8 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.BTN_STORE_EDGES, connected and not self._busy)
         self.Enable(IDS.BTN_SELECT_FACE, connected and not self._busy and in_poly_mode)
         self.Enable(IDS.BTN_SELECT_EDGE, connected and not self._busy and in_poly_mode)
-        self.Enable(IDS.BTN_MARK_SHARP,  connected and not self._busy)
-        self.Enable(IDS.CHK_SMART_EDGES, connected)
+        self.Enable(IDS.BTN_SELECT_SHARP, connected and not self._busy)
+        self.Enable(IDS.EDT_SHARP_ANGLE, connected)
 
         status = self.bridge.status_message
         self.SetString(IDS.LBL_STATUS,   f"Status: {status}")
@@ -673,6 +735,57 @@ class PlasticityDialog(gui.GeDialog):
                 shape                 = FacetShapeType.CUT,
             )
 
+        # ── Auto-Refacet tag creation / update ───────────────────────────
+        if self.GetBool(IDS.CHK_AUTO_REFACET):
+            self._stamp_auto_refacet_tags(doc, ids, tolerance, angle,
+                                          min_width, max_width, cct, cca,
+                                          spt, spa)
+
+    def _stamp_auto_refacet_tags(self, doc, ids, tolerance, angle,
+                                 min_width, max_width, cct, cca, spt, spa):
+        """Create or update auto-refacet tags on the selected Plasticity objects."""
+        from modules.handler import BC_PLASTICITY_ID, BC_PLASTICITY_FILENAME
+
+        doc.StartUndo()
+        try:
+            for filename, obj_id in ids:
+                # Find the C4D object via the handler's cache
+                key = (filename, obj_id)
+                obj = self.handler._items.get(key)
+                if not obj or obj.GetDocument() != doc:
+                    continue
+
+                # Find existing auto-refacet tag or create a new one
+                tag = obj.GetTag(REFACET_TAG_ID)
+                if tag:
+                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+                else:
+                    tag = c4d.BaseTag(REFACET_TAG_ID)
+                    if not tag:
+                        continue
+                    obj.InsertTag(tag)
+                    doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, tag)
+
+                # Write current dialog settings into the tag
+                tag[PREF_TOPOLOGY] = (PREF_TOPOLOGY_TRIS
+                                      if self._tri_mode
+                                      else PREF_TOPOLOGY_NGONS)
+                tag[PREF_OPTIONS_MODE] = (PREF_OPTIONS_ADVANCED
+                                          if self._advanced_mode
+                                          else PREF_OPTIONS_SIMPLE)
+                tag[PREF_TOLERANCE]       = tolerance
+                tag[PREF_ANGLE]           = angle
+                tag[PREF_MIN_WIDTH]       = min_width
+                tag[PREF_MAX_WIDTH]       = max_width
+                tag[PREF_CURVE_CHORD_TOL] = cct
+                tag[PREF_CURVE_CHORD_ANG] = cca
+                tag[PREF_SURF_PLANE_TOL]  = spt
+                tag[PREF_SURF_ANGLE_TOL]  = spa
+        finally:
+            doc.EndUndo()
+
+        c4d.EventAdd()
+
     # =========================================================================
     # Store Plasticity Faces
     # =========================================================================
@@ -726,15 +839,15 @@ class PlasticityDialog(gui.GeDialog):
                 "Select one or more polygons on a Plasticity object first.")
 
     # =========================================================================
-    # Auto Mark Edges
+    # Select Sharp Edges
     # =========================================================================
 
-    def _do_mark_sharp_edges(self):
+    def _do_select_sharp_edges(self):
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return
-        smart    = self.GetBool(IDS.CHK_SMART_EDGES)
-        affected = self.handler.apply_phong_breaks(doc, smart=smart)
+        angle_deg = math.degrees(self.GetFloat(IDS.EDT_SHARP_ANGLE))
+        affected = self.handler.select_sharp_edges(doc, angle_deg=angle_deg)
         if not affected:
             gui.MessageDialog(
                 "No Plasticity objects selected.\n"

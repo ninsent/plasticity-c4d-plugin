@@ -23,6 +23,8 @@ class EventType(Enum):
     NEW_VERSION = auto()
     NEW_FILE = auto()
     STATUS_UPDATE = auto()
+    HANDSHAKE_RESPONSE = auto()
+    PUT_SOME_RESPONSE = auto()
 
 
 @dataclass
