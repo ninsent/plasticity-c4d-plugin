@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Changed
 - **Select Sharp Edges** — selects all Plasticity boundary edges on selected objects and switches to edge mode; replaces the former Mark Sharp (PhongBreak) feature
 - **Angle threshold** — compact degree input field below the Select Sharp Edges button; filters edge selection to only include edges sharper than the specified dihedral angle (0° = all boundary edges)
+- **Refacet Angle inputs** — All angle-related input values have been switched from radians to degrees
 - Scene hierarchy restructured from flat root children to Inbox/Outbox sub-nulls
 - `_process_objects` now accepts `outbox_ids` set to skip protected objects during list/transaction processing
 

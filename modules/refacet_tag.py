@@ -115,13 +115,13 @@ class PlasticityRefacetTag(plugins.TagData):
         node[PREF_TOPOLOGY]        = PREF_TOPOLOGY_TRIS
         node[PREF_OPTIONS_MODE]    = PREF_OPTIONS_SIMPLE
         node[PREF_TOLERANCE]       = 0.01
-        node[PREF_ANGLE]           = 0.45
+        node[PREF_ANGLE]           = math.radians(25.0)
         node[PREF_MIN_WIDTH]       = 0.0
         node[PREF_MAX_WIDTH]       = 0.0
         node[PREF_CURVE_CHORD_TOL] = 0.01
-        node[PREF_CURVE_CHORD_ANG] = 0.35
+        node[PREF_CURVE_CHORD_ANG] = math.radians(20.0)
         node[PREF_SURF_PLANE_TOL]  = 0.01
-        node[PREF_SURF_ANGLE_TOL]  = 0.35
+        node[PREF_SURF_ANGLE_TOL]  = math.radians(20.0)
         return True
 
     # ----- Execute (no-op) ---------------------------------------------

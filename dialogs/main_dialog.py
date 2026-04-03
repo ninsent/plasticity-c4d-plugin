@@ -108,13 +108,13 @@ class PlasticityDialog(gui.GeDialog):
         self._tri_mode          = True
         self._advanced_mode     = False
         self._tolerance         = 0.01
-        self._angle             = 0.45
+        self._angle             = math.radians(25.0)
         self._min_width         = 0.0
         self._max_width         = 0.0
         self._curve_chord_tol   = 0.01
-        self._curve_chord_angle = 0.35
+        self._curve_chord_angle = math.radians(20.0)
         self._surface_plane_tol = 0.01
-        self._surface_angle_tol = 0.35
+        self._surface_angle_tol = math.radians(20.0)
         self._unit_scale        = 1.0
         self._busy              = False
 
@@ -421,8 +421,9 @@ class PlasticityDialog(gui.GeDialog):
                       min=0.0001, max=0.1, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_ANGLE, self._angle,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Advanced sliders
         self.SetFloat(IDS.SLD_MIN_WIDTH, self._min_width,
@@ -435,14 +436,16 @@ class PlasticityDialog(gui.GeDialog):
                       min=0.0001, max=1.0, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_CURVE_CHORD_ANG, self._curve_chord_angle,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
         self.SetFloat(IDS.SLD_SURF_PLANE_TOL, self._surface_plane_tol,
                       min=0.0001, max=1.0, step=0.001,
                       format=c4d.FORMAT_FLOAT)
         self.SetFloat(IDS.SLD_SURF_ANGLE_TOL, self._surface_angle_tol,
-                      min=0.01, max=1.57, step=0.01,
-                      format=c4d.FORMAT_FLOAT)
+                      min=math.radians(1.0), max=math.radians(90.0),
+                      step=math.radians(1.0),
+                      format=c4d.FORMAT_DEGREE)
 
         # Unit scale
         self.SetFloat(IDS.SLD_UNIT_SCALE, self._unit_scale,

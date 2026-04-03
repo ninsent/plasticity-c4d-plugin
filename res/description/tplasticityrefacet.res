@@ -38,9 +38,9 @@ CONTAINER Tplasticityrefacet
             }
             REAL PLASTICITYREFACET_ANGLE
             {
-                UNIT REAL;
-                MIN 0.01; MAX 1.57; STEP 0.01;
-                MINSLIDER 0.01; MAXSLIDER 1.57;
+                UNIT DEGREE;
+                MIN 0.0175; MAX 1.5708; STEP 0.0175;
+                MINSLIDER 0.0175; MAXSLIDER 1.5708;
                 CUSTOMGUI REALSLIDER;
             }
         }
@@ -73,8 +73,8 @@ CONTAINER Tplasticityrefacet
             REAL PLASTICITYREFACET_CURVE_CHORD_ANG
             {
                 UNIT REAL;
-                MIN 0.01; MAX 1.57; STEP 0.01;
-                MINSLIDER 0.01; MAXSLIDER 1.57;
+                MIN 0.0175; MAX 1.5708; STEP 0.0175;
+                MINSLIDER 0.0175; MAXSLIDER 1.5708;
                 CUSTOMGUI REALSLIDER;
             }
             REAL PLASTICITYREFACET_SURF_PLANE_TOL
@@ -87,8 +87,8 @@ CONTAINER Tplasticityrefacet
             REAL PLASTICITYREFACET_SURF_ANGLE_TOL
             {
                 UNIT REAL;
-                MIN 0.01; MAX 1.57; STEP 0.01;
-                MINSLIDER 0.01; MAXSLIDER 1.57;
+                MIN 0.0175; MAX 1.5708; STEP 0.0175;
+                MINSLIDER 0.0175; MAXSLIDER 1.5708;
                 CUSTOMGUI REALSLIDER;
             }
         }
