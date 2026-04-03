@@ -3,7 +3,7 @@
 A Cinema 4D plugin that connects to [Plasticity](https://www.plasticity.xyz/) via WebSocket, enabling live mesh synchronization between the two applications.
 Model in Plasticity's NURBS environment, see the tessellated result in Cinema 4D in real time.
 
-**[Download Latest Release](https://github.com/ninsent/plasticity-c4d-plugin/releases/download/v1.1.0/PlasticityBridge.zip)**
+**[Download Latest Release](https://github.com/ninsent/plasticity-c4d-plugin/releases/download/v1.1.0/PlasticityBridge_v1.1.0.zip)**
 
 [![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/ninsent/plasticity-c4d-plugin) [![License](https://img.shields.io/badge/license-MIT-teallight.svg)](LICENSE) [![Cinema 4D](https://img.shields.io/badge/Cinema_4D-2023+-orange.svg)](https://www.maxon.net/cinema-4d)
 
