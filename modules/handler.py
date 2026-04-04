@@ -388,6 +388,10 @@ class SceneHandler:
         self._groups = {}   # (filename, id) -> c4d.BaseObject  (null groups)
         self._roots  = {}   # filename       -> c4d.BaseObject  (root nulls)
 
+        # Persistent set of all Plasticity IDs returned by PUT_SOME responses.
+        # Prevents uploaded objects from being re-imported on subsequent refreshes.
+        self._uploaded_ids = set()
+
         # v2.1.0: back-reference to client (set in plasticity_c4d.pyp)
         self.client = None
 
@@ -416,6 +420,7 @@ class SceneHandler:
         self._items.clear()
         self._groups.clear()
         self._roots.clear()
+        self._uploaded_ids.clear()
 
     def on_disconnect(self):
         self._items.clear()
@@ -688,6 +693,16 @@ class SceneHandler:
             f"PutSome OK: {len(group_results)} groups, {len(item_results)} items")
         print(f"[Plasticity] PutSome succeeded: "
               f"{len(group_results)} groups, {len(item_results)} items")
+
+        # Remember all uploaded IDs so they are filtered on subsequent refreshes
+        for item in item_results:
+            sid = item.get("stable_id", 0)
+            if sid:
+                self._uploaded_ids.add(sid)
+        for group in group_results:
+            gid = group.get("group_id", 0)
+            if gid:
+                self._uploaded_ids.add(gid)
         c4d.EventAdd()
 
     @staticmethod
@@ -807,16 +822,26 @@ class SceneHandler:
     # =========================================================================
 
     def _get_outbox_plasticity_ids(self, doc, filename):
-        """Gather all plasticity_id values from objects in the Outbox."""
+        """Gather all Plasticity IDs associated with outbox objects.
+
+        Includes:
+          - BC_PLASTICITY_ID on outbox items (stable_id from PUT_SOME)
+          - BC_PLASTICITY_GROUP_ID on outbox nulls (group_id from PUT_SOME)
+          - All IDs accumulated from prior PUT_SOME responses this session
+        """
         outbox = self._get_or_create_outbox(doc, filename)
-        ids = set()
+        ids = set(self._uploaded_ids)
 
         def gather(parent):
             child = parent.GetDown()
             while child:
-                pid = child.GetDataInstance().GetInt32(BC_PLASTICITY_ID, 0)
+                bc = child.GetDataInstance()
+                pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
                 if pid != 0:
                     ids.add(pid)
+                gid = bc.GetInt32(BC_PLASTICITY_GROUP_ID, 0)
+                if gid != 0:
+                    ids.add(gid)
                 gather(child)
                 child = child.GetNext()
 
