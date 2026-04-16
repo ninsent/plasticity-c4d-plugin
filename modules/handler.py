@@ -1839,35 +1839,62 @@ class SceneHandler:
     def _collect_polygon_caches(self, obj, result):
         """Recursively collect polygon data from an object's cache hierarchy.
 
-        Deformers (Bend, Twist, FFD …) have no cache and are safely skipped.
-        GetDeformCache() is checked first so that deformer effects are included.
+        Traversal order:
+          1. GetDeformCache() — polygon WITH active deformers (Bend, Twist …).
+          2. Direct Opolygon — polygon with no active deformers.
+          3. GetCache()      — generator or parametric primitive output
+                              (Symmetry, Array, Boole, Cube, Sphere …).
+          4. GetDown()       — cache containers that are plain null/group
+                              hierarchies whose polygon children need walking.
+
+        Checking (1) before (2) is essential: a polygon object that has
+        deformers applied stores the deformed result in GetDeformCache(), not
+        in the object itself.  Returning early on Opolygon before this check
+        would silently discard all deformer effects.
         """
-        # Object is already a polygon — use it directly.
+        # 1. Deform cache — always takes priority over the raw polygon data.
+        deform_cache = obj.GetDeformCache()
+        if deform_cache is not None:
+            self._collect_polygon_caches(deform_cache, result)
+            sib = deform_cache.GetNext()
+            while sib:
+                self._collect_polygon_caches(sib, result)
+                sib = sib.GetNext()
+            return
+
+        # 2. Already a fully-evaluated polygon with no active deformers.
         if obj.CheckType(c4d.Opolygon) and obj.GetPointCount() > 0:
             result.append(obj)
             return
 
-        # Deform cache takes priority (includes deformer effects).
-        cache = obj.GetDeformCache()
-        if cache is None:
-            cache = obj.GetCache()
-
+        # 3. Generator / parametric cache (Symmetry, Boole, Cube, Sphere …).
+        cache = obj.GetCache()
         if cache is not None:
-            # The cache itself may be a polygon or a hierarchy (e.g. a Null
-            # with polygon children for generators like Symmetry).
             self._collect_polygon_caches(cache, result)
-            # Some generators produce sibling caches — walk those too.
-            sibling = cache.GetNext()
-            while sibling:
-                self._collect_polygon_caches(sibling, result)
-                sibling = sibling.GetNext()
+            sib = cache.GetNext()
+            while sib:
+                self._collect_polygon_caches(sib, result)
+                sib = sib.GetNext()
+            return
+
+        # 4. No cache found on this node — walk its children.
+        # This handles null/group containers returned as cache hierarchies by
+        # some generators (e.g. Boole in certain C4D builds returns a null
+        # whose polygon children hold the actual geometry).
+        child = obj.GetDown()
+        while child:
+            self._collect_polygon_caches(child, result)
+            child = child.GetNext()
 
     def _combine_polygon_sources(self, poly_sources):
         """Clone polygon sources and optionally JOIN them into one mesh.
 
         Returns (poly_obj, is_temp=True) or (None, False) on failure.
         """
+        # Keep the temp doc alive on self so the returned poly_obj is not
+        # freed by Python's GC before the caller reads it.
         temp_doc = c4d.documents.BaseDocument()
+        self._temp_cage_doc = temp_doc
         clones = []
         for src in poly_sources:
             clone = src.GetClone(c4d.COPYFLAGS_NONE)
@@ -1907,7 +1934,10 @@ class SceneHandler:
 
         Returns (poly_obj, is_temp=True) or (None, False) on failure.
         """
+        # Keep the temp doc alive on self so the returned poly_obj is not
+        # freed by Python's GC before the caller reads it.
         temp_doc = c4d.documents.BaseDocument()
+        self._temp_cage_doc = temp_doc
 
         # Collect and clone the SDS's direct children (preserving order).
         children = []
@@ -1942,6 +1972,20 @@ class SceneHandler:
         # build their polygon caches when the document executes its passes.
         # Without this, CSTO has no geometry to convert.
         temp_doc.ExecutePasses(None, True, True, True, 0)
+
+        # After evaluation, try reading caches directly.  For generators like
+        # Loft, Sweep, Lathe, etc., ExecutePasses populates GetCache() and this
+        # is faster and more reliable than CSTO.  Deformer effects are also
+        # captured via GetDeformCache() through the same traversal.
+        cache_sources = []
+        # Walk every top-level clone in the temp doc.
+        t = temp_doc.GetFirstObject()
+        while t:
+            self._collect_polygon_caches(t, cache_sources)
+            t = t.GetNext()
+
+        if cache_sources:
+            return self._combine_polygon_sources(cache_sources)
 
         # Run Current State to Object.
         csto_list = [target]
