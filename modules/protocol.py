@@ -6,7 +6,6 @@ Uses struct.unpack_from for fast bulk decoding instead of Python loops.
 """
 
 import struct
-import array
 from enum import IntEnum
 from typing import Tuple, List, Dict, Any, Optional
 

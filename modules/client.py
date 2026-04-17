@@ -8,7 +8,6 @@ Architecture matches the Blender addon: only the listen loop calls recv().
 
 import asyncio
 import threading
-import struct
 import weakref
 from typing import Optional, List
 from concurrent.futures import Future
@@ -22,7 +21,7 @@ except ImportError:
     print("[Plasticity] Warning: websockets library not found")
 
 from modules.protocol import (
-    MessageType, MessageParser, FacetShapeType,
+    MessageType, MessageParser,
     encode_list_all, encode_list_visible, encode_subscribe_all,
     encode_subscribe_some, encode_unsubscribe, encode_refacet_some,
     encode_handshake, encode_put_some,
@@ -263,7 +262,6 @@ class PlasticityClient:
             try:
                 future.result(timeout=timeout)
             except Exception as e:
-                print(f"[Plasticity] Send failed: {e}")
                 self.status.error(f"Send failed: {e}")
                 self.bridge.push_event(BridgeEvent(
                     event_type=EventType.STATUS_UPDATE,

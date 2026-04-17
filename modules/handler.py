@@ -609,22 +609,21 @@ class SceneHandler:
         c4d.EventAdd()
 
     def _on_new_version(self, event: BridgeEvent):
+        # Status display and auto-refresh are handled by the dialog, which
+        # knows whether Live Link is active.  Update filename only.
         data = event.data
         if data:
-            fn  = data.get('filename', '')
-            ver = data.get('version', 0)
-            msg = f"New version available — '{fn}' v{ver}. Click Refresh to update."
-            self.bridge.status_message = msg
-            print(f"[Plasticity] {msg}")
+            fn = data.get('filename', '')
+            if fn:
+                self.bridge.filename = fn
 
     def _on_new_file(self, event: BridgeEvent):
+        # Status display and auto-refresh are handled by the dialog.
         data = event.data
         if data:
-            fn  = data.get('filename', '')
-            msg = f"New file opened in Plasticity: '{fn}'. Click Refresh to import."
-            self.bridge.status_message = msg
-            self.bridge.filename = fn
-            print(f"[Plasticity] {msg}")
+            fn = data.get('filename', '')
+            if fn:
+                self.bridge.filename = fn
 
     # =========================================================================
     # v2.1.0: Handshake & PutSome handlers

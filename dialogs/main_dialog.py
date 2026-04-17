@@ -499,7 +499,7 @@ class PlasticityDialog(gui.GeDialog):
     # Timer
     # =========================================================================
 
-    def Timer(self, msg):
+    def Timer(self, _):
         self.bridge.process_pending_events()
         self._update_ui_state()
 
@@ -507,7 +507,7 @@ class PlasticityDialog(gui.GeDialog):
     # Commands
     # =========================================================================
 
-    def Command(self, id, msg):
+    def Command(self, id, _):
         # ── QuickTab toggled ─────────────────────────────────────────────
         if id == IDS.QUICKTAB:
             self._sync_tab_visibility()
@@ -651,10 +651,10 @@ class PlasticityDialog(gui.GeDialog):
     # Bridge event callbacks
     # =========================================================================
 
-    def _on_connected(self, event: BridgeEvent):
+    def _on_connected(self, _: BridgeEvent):
         self._busy = False
 
-    def _on_disconnected(self, event: BridgeEvent):
+    def _on_disconnected(self, _: BridgeEvent):
         self._busy = False
         self.SetBool(IDS.CHK_LIVELINK, False)
 
@@ -663,17 +663,27 @@ class PlasticityDialog(gui.GeDialog):
         error = event.error_message or "Unknown error"
         gui.MessageDialog(f"Connection error:\n{error}")
 
-    def _on_operation_complete(self, event: BridgeEvent):
+    def _on_operation_complete(self, _: BridgeEvent):
         self._busy = False
 
-    def _on_status_update(self, event: BridgeEvent):
+    def _on_status_update(self, _: BridgeEvent):
         self._busy = False
 
-    def _on_new_version(self, event: BridgeEvent):
-        pass
+    def _on_new_version(self, _: BridgeEvent):
+        if self.GetBool(IDS.CHK_LIVELINK) and not self._busy:
+            self._busy = True
+            if self.GetBool(IDS.CHK_ONLY_VISIBLE):
+                self.client.list_visible()
+            else:
+                self.client.list_all()
 
-    def _on_new_file(self, event: BridgeEvent):
-        pass
+    def _on_new_file(self, _: BridgeEvent):
+        if self.GetBool(IDS.CHK_LIVELINK) and not self._busy:
+            self._busy = True
+            if self.GetBool(IDS.CHK_ONLY_VISIBLE):
+                self.client.list_visible()
+            else:
+                self.client.list_all()
 
     # =========================================================================
     # Refacet
@@ -744,8 +754,6 @@ class PlasticityDialog(gui.GeDialog):
     def _stamp_auto_refacet_tags(self, doc, ids, tolerance, angle,
                                  min_width, max_width, cct, cca, spt, spa):
         """Create or update auto-refacet tags on the selected Plasticity objects."""
-        from modules.handler import BC_PLASTICITY_ID, BC_PLASTICITY_FILENAME
-
         doc.StartUndo()
         try:
             for filename, obj_id in ids:
