@@ -11,9 +11,9 @@ UI uses Cinema 4D's native QUICKTAB interface:
 import c4d
 import math
 from c4d import gui
-from modules.threading_bridge import EventType, BridgeEvent
-from modules.protocol import FacetShapeType, MessageType
-from modules.refacet_tag import (
+from core.threading_bridge import EventType, BridgeEvent
+from core.protocol import FacetShapeType, MessageType
+from core.refacet_tag import (
     TAG_PLUGIN_ID as REFACET_TAG_ID,
     PREF_TOPOLOGY, PREF_TOPOLOGY_TRIS, PREF_TOPOLOGY_NGONS,
     PREF_OPTIONS_MODE, PREF_OPTIONS_SIMPLE, PREF_OPTIONS_ADVANCED,

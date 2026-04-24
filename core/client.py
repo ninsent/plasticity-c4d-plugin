@@ -20,13 +20,13 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
     print("[Plasticity] Warning: websockets library not found")
 
-from modules.protocol import (
+from core.protocol import (
     MessageType, MessageParser,
     encode_list_all, encode_list_visible, encode_subscribe_all,
     encode_subscribe_some, encode_unsubscribe, encode_refacet_some,
     encode_handshake, encode_put_some,
 )
-from modules.threading_bridge import (
+from core.threading_bridge import (
     ThreadingBridge, BridgeEvent, EventType, StatusReporter,
 )
 

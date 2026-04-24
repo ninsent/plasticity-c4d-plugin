@@ -17,7 +17,7 @@ from c4d import plugins
 # ---------------------------------------------------------------------------
 # Plugin ID — replace with a properly registered ID from plugincafe.maxon.net
 # ---------------------------------------------------------------------------
-TAG_PLUGIN_ID = 1066943
+TAG_PLUGIN_ID = 1068209
 
 # ---------------------------------------------------------------------------
 # Parameter IDs  (must match res/description/tplasticityrefacet.h)

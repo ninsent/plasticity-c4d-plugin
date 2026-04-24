@@ -64,9 +64,9 @@ import math
 import uuid
 from typing import Dict, List, Optional, Any, Set, Tuple
 
-from modules.protocol import ObjectType, MessageType
-from modules.threading_bridge import ThreadingBridge, BridgeEvent, EventType
-from modules.refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
+from core.protocol import ObjectType, MessageType
+from core.threading_bridge import ThreadingBridge, BridgeEvent, EventType
+from core.refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
 
 # BaseContainer keys — offsets from registered plugin ID 1066929
 PLUGIN_ID              = 1066929

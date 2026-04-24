@@ -29,9 +29,9 @@ __res__.Init(plugin_dir)
 
 # Now try to import modules with error handling
 try:
-    from modules.client import PlasticityClient
-    from modules.handler import SceneHandler
-    from modules.threading_bridge import ThreadingBridge
+    from core.client import PlasticityClient
+    from core.handler import SceneHandler
+    from core.threading_bridge import ThreadingBridge
     from dialogs.main_dialog import PlasticityDialog
     IMPORT_SUCCESS = True
     IMPORT_ERROR = None
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     # Register the auto-refacet tag plugin
     if IMPORT_SUCCESS:
         try:
-            from modules.refacet_tag import register_refacet_tag
+            from core.refacet_tag import register_refacet_tag
             register_refacet_tag(icon, __res__)
         except Exception as e:
             print(f"[Plasticity Bridge] Failed to register refacet tag: {e}")
