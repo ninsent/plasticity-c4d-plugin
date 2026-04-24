@@ -45,7 +45,7 @@ plasticity-bridge-c4d/
 ├── dialogs/
 │   ├── __init__.py
 │   └── main_dialog.py         # UI layout, state, and user commands
-├── modules/
+├── core/
 │   ├── __init__.py
 │   ├── client.py              # WebSocket client (handshake, send/recv, async loop)
 │   ├── handler.py             # Scene handler: geometry, hierarchy, utilities, auto-refacet
