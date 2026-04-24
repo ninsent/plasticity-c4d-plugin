@@ -3,9 +3,9 @@
 A Cinema 4D plugin that connects to [Plasticity](https://www.plasticity.xyz/) via WebSocket, enabling live mesh synchronization between the two applications.
 Model in Plasticity's NURBS environment, see the tessellated result in Cinema 4D in real time.
 
-**[Download Latest Release](https://github.com/ninsent/plasticity-c4d-plugin/releases/download/v1.1.0/PlasticityBridge_v1.1.0.zip)**
+**[Download Latest Release](https://github.com/ninsent/plasticity-c4d-plugin/releases/download/v1.1.5/PlasticityBridge_v1.1.5.zip)** · **[Official Documentation](https://doc.plasticity.xyz/cinema-4d/install-c4d-plugin)**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/ninsent/plasticity-c4d-plugin) [![License](https://img.shields.io/badge/license-MIT-teallight)](LICENSE) [![Cinema 4D](https://img.shields.io/badge/Cinema_4D-2023+-royalblue)](https://www.maxon.net/cinema-4d) ![Downloads](https://img.shields.io/github/downloads/ninsent/plasticity-c4d-plugin/total?color=orchid&cacheSeconds=3600)
+[![Version](https://img.shields.io/badge/version-1.1.5-blue)](https://github.com/ninsent/plasticity-c4d-plugin) [![License](https://img.shields.io/badge/license-MIT-teallight)](LICENSE) [![Cinema 4D](https://img.shields.io/badge/Cinema_4D-2023+-royalblue)](https://www.maxon.net/cinema-4d) ![Downloads](https://img.shields.io/github/downloads/ninsent/plasticity-c4d-plugin/total?color=orchid&cacheSeconds=3600)
 
 ## Features
 
@@ -16,7 +16,7 @@ Model in Plasticity's NURBS environment, see the tessellated result in Cinema 4D
 - **Custom Normals** — Per-corner normals written to a managed `NormalTag` with accurate shading in both modes
 - **Refacet** — Re-tessellate selected objects with full control over tolerance, angle, width, and chord parameters
 - **Auto-Refacet Tag** — Custom tag that persists refacet settings per object; geometry is automatically re-tessellated after every refresh or live-link update
-- **Inbox / Outbox** — Objects from Plasticity land in the Inbox; user-created SDS objects in the Outbox can be uploaded back to Plasticity via `PUT_SOME`
+- **Inbox / Outbox** — Objects from Plasticity land in the Inbox; user-created SDS objects **and parametric generators (polysplines, Loft, Sweep, Lathe, Symmetry, Boole, primitives …)** in the Outbox can be uploaded back to Plasticity via `PUT_SOME`
 - **Store Faces** — Creates one `PolygonSelectionTag` per CAD face group, ready for per-face material assignment
 - **Store Edges** — Creates an `EdgeSelectionTag` containing all CAD boundary edges
 - **Select Faces** — Expands current polygon selection to whole CAD face groups
@@ -70,7 +70,7 @@ Vertex positions are scaled by 100× (Plasticity uses metres, C4D uses centimetr
 
 ```
 Plasticity: <filename>          ← root null (unit scale lives here)
-├── Outbox                      ← user-created SDS objects for upload
+├── Outbox                      ← user-created SDS objects & parametric generators for upload
 └── Inbox                       ← objects received from Plasticity
     ├── Group A                 ← Plasticity group → C4D null
     │   ├── Solid 1             ← Plasticity solid → C4D polygon object
@@ -78,11 +78,13 @@ Plasticity: <filename>          ← root null (unit scale lives here)
     └── Sheet 1
 ```
 
-Objects in the Outbox are protected from incoming updates and can be uploaded to Plasticity via the `PUT_SOME_1` protocol message when the server supports it.
+Objects in the Outbox are protected from incoming updates and can be uploaded to Plasticity via the `PUT_SOME_1` protocol message when the server supports it. As of 1.1.5 the Outbox resolves parametric generators (Loft, Sweep, Lathe, Symmetry, Boole, Array, parametric primitives, and polyspline-driven objects) in addition to plain polygon meshes.
 
 ---
 
 ## Installation
+
+> **Official setup guide:** [doc.plasticity.xyz/cinema-4d/install-c4d-plugin](https://doc.plasticity.xyz/cinema-4d/install-c4d-plugin)
 
 ### For Users
 
@@ -93,6 +95,8 @@ Objects in the Outbox are protected from incoming updates and can be uploaded to
    - **macOS:** `~/Library/Application Support/Maxon/Cinema 4D/plugins/`
 4. Restart Cinema 4D
 5. The plugin appears under **Extensions → Plasticity Bridge**
+
+> **Upgrading from 1.1.0:** the Auto-Refacet tag plugin ID has changed to a registered Maxon ID. Scenes saved with 1.1.0 will lose their Auto-Refacet tag bindings on load — re-apply the tag via the **Auto-Refacet** checkbox in the Basic tab.
 
 ### For Developers
 
@@ -132,6 +136,7 @@ No build step or `pip install` needed — the `websockets` library is bundled in
 3. **Enable Live Link**
    - Toggle **Live Link** to receive real-time updates
    - Every change in Plasticity is reflected in Cinema 4D within a frame
+   - When a new file or new version is opened in Plasticity, Cinema 4D re-imports automatically
 
 4. **Adjust settings**
    - **Unit Scale** (0.0001–100): Scale factor applied to the root null
@@ -146,8 +151,8 @@ No build step or `pip install` needed — the `websockets` library is bundled in
    - Delete the tag to stop auto-refaceting an object
 
 6. **Outbox (upload to Plasticity)**
-   - Place Subdivision Surface objects in the **Outbox** null under the root
-   - On Refresh, outbox meshes are uploaded to Plasticity via `PUT_SOME` (if the server supports it)
+   - Place Subdivision Surface objects, parametric generators (Loft, Sweep, Lathe, Symmetry, Boole, Array, primitives), or polyspline-driven objects in the **Outbox** null under the root
+   - On Refresh, outbox objects are evaluated and uploaded to Plasticity via `PUT_SOME` (if the server supports it)
 
 7. **Use utilities**
    - Select one or more Plasticity objects in the viewport
@@ -185,6 +190,7 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 ### Learn More
 
 - [Plasticity Official Website](https://www.plasticity.xyz/)
+- [Plasticity Manual — Cinema 4D Plugin Setup](https://doc.plasticity.xyz/cinema-4d/install-c4d-plugin)
 - [Plasticity Manual — Blender Bridge Setup](https://doc.plasticity.xyz/blender/install-blender-addon)
 - [Plasticity Blender Bridge (original addon)](https://github.com/nkallen/plasticity-blender-addon)
 - [Cinema 4D Python SDK Documentation](https://developers.maxon.net/docs/py/)
@@ -192,6 +198,10 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 ---
 
 ## Changelog
+
+### [1.1.5] - 2026-04-24
+
+- Parametric generator export (polysplines, Loft, Sweep, Lathe, Symmetry, Boole, Array, primitives), Live Link auto-refresh on new file / version, `modules/` → `core/` rename, registered Auto-Refacet tag plugin ID
 
 ### [1.1.0] - 2026-04-03
 

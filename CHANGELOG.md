@@ -4,6 +4,23 @@ All notable changes to Plasticity Cinema 4D Bridge will be documented in this fi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
+## [1.1.5] - 2026-04-24
+
+### Fixed
+- **Parametric generator export** — polysplines, spline-driven generators (Loft, Sweep, Lathe), Symmetry, Boole, Array, and parametric primitives placed in the Outbox are now correctly evaluated and uploaded to Plasticity via `PUT_SOME_1`; previously only pre-baked polygon meshes round-tripped
+- **Temp-document lifetime** — evaluation document is retained on the scene handler so GC can't free it before the resulting polygon object is read; fixes intermittent empty-mesh on Outbox refresh
+- **Live Link auto-refresh** — `NEW_VERSION` and `NEW_FILE` callbacks now trigger re-import while Live Link is active; previously empty stubs
+- **Cache traversal** — `_collect_polygon_caches` rewritten with explicit deform-cache → polygon → generator-cache → children traversal; handles null/group cache containers returned by Boole
+
+### Changed
+- Internal package renamed from `modules/` to `core/`; all imports updated
+- `NEW_VERSION` / `NEW_FILE` handling moved from scene handler to dialog (honours Live Link + busy state)
+- **Auto-Refacet tag plugin ID** changed from `1066943` to `1068209` (properly registered via Maxon); scenes from 1.1.0 will lose tag bindings on load — re-apply via the Auto-Refacet checkbox
+
+### Removed
+- Dead imports (`struct`, `FacetShapeType`, `array`, stale handler imports in dialog)
+- Noisy `[Plasticity] Send failed` print in WebSocket send loop
+
 ## [1.1.0] - 2026-04-03
 
 ### Added
