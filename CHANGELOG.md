@@ -4,6 +4,13 @@ All notable changes to Plasticity Cinema 4D Bridge will be documented in this fi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
+## [1.1.6] - 2026-06-13
+
+### Fixed
+- **N-gon collapse on repeated refacet** — re-faceting in N-gon mode with unchanged settings no longer collapses N-gons back into triangles; `ResizeObject` is now called with `ncnt=0` to clear stale N-gon structure before the in-place melt
+- **User edits lost on refresh** — objects re-parented under user generators (ZRemesher, SDS) or custom nulls are no longer pulled back into the Inbox; hierarchy is only synced while an object stays in a plugin-managed location
+- **Visibility overrides reset on refresh** — editor/render visibility set in C4D is preserved; Plasticity-side visibility is only re-applied when the incoming flags change, tracked via the new `BC_PLASTICITY_FLAGS` entry
+
 ## [1.1.5] - 2026-04-24
 
 ### Fixed
