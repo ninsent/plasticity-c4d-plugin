@@ -83,6 +83,7 @@ BC_PLASTICITY_PNS_ID        = PLUGIN_ID + 9    # 1066938  (persistent string ID 
 BC_PLASTICITY_COLLECTION_ID = PLUGIN_ID + 10   # 1066939  (persistent string ID for outbox groups)
 BC_PLASTICITY_VERSION       = PLUGIN_ID + 11   # 1066940
 BC_PLASTICITY_GROUP_ID      = PLUGIN_ID + 12   # 1066941
+BC_PLASTICITY_FLAGS         = PLUGIN_ID + 13   # 1066942  (last applied Plasticity flags)
 
 MANAGED_NORMAL_TAG_NAME  = "__plasticity_normals__"
 MANAGED_FACE_SEL_PREFIX  = "Plasticity Face "
@@ -848,6 +849,42 @@ class SceneHandler:
         return ids
 
     # =========================================================================
+    # Hierarchy / visibility preservation helpers
+    # =========================================================================
+
+    def _is_managed_parent(self, parent, filename, inbox):
+        """True if `parent` is a location the plugin itself manages: the
+        Inbox null or a Plasticity group null of the same file.
+
+        If the user has re-parented an object anywhere else (under a
+        generator like ZRemesher/SDS, their own null, ...), hierarchy sync
+        must leave it alone — that re-parenting was intentional.
+        """
+        if parent is None:
+            return False
+        if parent == inbox:
+            return True
+        bc = parent.GetDataInstance()
+        if bc.GetBool(BC_PLASTICITY_INBOX):
+            return True
+        return (parent.CheckType(c4d.Onull)
+                and bc.GetInt32(BC_PLASTICITY_ID, 0) != 0
+                and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename)
+
+    @staticmethod
+    def _apply_visibility(obj, flags, vis):
+        """Push editor/render visibility only when the Plasticity-side flags
+        actually changed since the last refresh.  This lets the user
+        hide/show objects in C4D without every refresh reverting it, while
+        visibility toggles made in Plasticity still propagate.
+        """
+        bc = obj.GetDataInstance()
+        if bc.GetInt32(BC_PLASTICITY_FLAGS, -1) != flags:
+            obj[c4d.ID_BASEOBJECT_VISIBILITY_EDITOR] = vis
+            obj[c4d.ID_BASEOBJECT_VISIBILITY_RENDER] = vis
+            bc.SetInt32(BC_PLASTICITY_FLAGS, flags)
+
+    # =========================================================================
     # Two-pass object processing
     # =========================================================================
 
@@ -965,11 +1002,11 @@ class SceneHandler:
                 if parent_id > 0 and (filename, parent_id) in self._groups:
                     target_parent = self._groups[(filename, parent_id)]
                 if grp.GetUp() != target_parent:
-                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, grp)
-                    grp.Remove()
-                    self._insert_last_child(doc, grp, target_parent)
-                grp[c4d.ID_BASEOBJECT_VISIBILITY_EDITOR] = vis
-                grp[c4d.ID_BASEOBJECT_VISIBILITY_RENDER]  = vis
+                    if self._is_managed_parent(grp.GetUp(), filename, inbox):
+                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, grp)
+                        grp.Remove()
+                        self._insert_last_child(doc, grp, target_parent)
+                self._apply_visibility(grp, flags, vis)
 
             elif obj_type in (ObjectType.SOLID, ObjectType.SHEET):
                 key = (filename, obj_id)
@@ -980,11 +1017,11 @@ class SceneHandler:
                 if parent_id > 0 and (filename, parent_id) in self._groups:
                     target_parent = self._groups[(filename, parent_id)]
                 if obj.GetUp() != target_parent:
-                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-                    obj.Remove()
-                    self._insert_last_child(doc, obj, target_parent)
-                obj[c4d.ID_BASEOBJECT_VISIBILITY_EDITOR] = vis
-                obj[c4d.ID_BASEOBJECT_VISIBILITY_RENDER]  = vis
+                    if self._is_managed_parent(obj.GetUp(), filename, inbox):
+                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+                        obj.Remove()
+                        self._insert_last_child(doc, obj, target_parent)
+                self._apply_visibility(obj, flags, vis)
 
         return deferred_ngons
 
@@ -1187,7 +1224,7 @@ class SceneHandler:
             return [], {}, [], None
 
         self._strip_managed_tags(obj)
-        obj.ResizeObject(len(points), len(polys))
+        obj.ResizeObject(len(points), len(polys), 0)
         self._write_points_and_polys(obj, points, polys)
 
         poly_face_map = None
