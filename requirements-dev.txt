@@ -1,0 +1,5 @@
+# Development / CI only — never shipped with the plugin.
+# The plugin itself runs in Cinema 4D's embedded Python and only uses the
+# standard library plus the bundled libs/websockets.
+pytest>=7.4,<9
+pytest-cov>=4.1,<7

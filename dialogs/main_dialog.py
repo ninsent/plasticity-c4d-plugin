@@ -10,9 +10,11 @@ UI uses Cinema 4D's native QUICKTAB interface:
 
 import c4d
 import math
+import time
 from c4d import gui
 from core.threading_bridge import EventType, BridgeEvent
-from core.protocol import FacetShapeType, MessageType
+from core.protocol import MessageType
+from core.refacet_settings import build_refacet_kwargs
 from core.refacet_tag import (
     TAG_PLUGIN_ID as REFACET_TAG_ID,
     PREF_TOPOLOGY, PREF_TOPOLOGY_TRIS, PREF_TOPOLOGY_NGONS,
@@ -96,6 +98,10 @@ def _add_section_header(dlg, gadget_id, title):
 class PlasticityDialog(gui.GeDialog):
     TIMER_INTERVAL = 16   # ~60 fps
 
+    #: Last-resort guard: a request that gets neither a response nor an
+    #: error within this many seconds releases the busy state.
+    BUSY_TIMEOUT = 120.0
+
     def __init__(self, client, handler, bridge):
         super().__init__()
         self.client   = client
@@ -117,6 +123,8 @@ class PlasticityDialog(gui.GeDialog):
         self._surface_angle_tol = math.radians(20.0)
         self._unit_scale        = 1.0
         self._busy              = False
+        self._busy_since        = 0.0
+        self._ui_state          = None   # last applied enable/text state
 
         # QuickTab widget references
         self._quicktab          = None
@@ -132,8 +140,8 @@ class PlasticityDialog(gui.GeDialog):
         bridge.register_callback(EventType.LIST_RESPONSE,    self._on_operation_complete)
         bridge.register_callback(EventType.REFACET_RESPONSE, self._on_operation_complete)
         bridge.register_callback(EventType.STATUS_UPDATE,    self._on_status_update)
-        # v2.1.0
         bridge.register_callback(EventType.PUT_SOME_RESPONSE, self._on_operation_complete)
+        bridge.register_callback(EventType.OPERATION_FAILED, self._on_operation_failed)
 
     # =========================================================================
     # Layout
@@ -501,7 +509,17 @@ class PlasticityDialog(gui.GeDialog):
 
     def Timer(self, _):
         self.bridge.process_pending_events()
+        if (self._busy and self.BUSY_TIMEOUT
+                and time.monotonic() - self._busy_since > self.BUSY_TIMEOUT):
+            self._busy = False
+            self.bridge.status_message = (
+                "Error: No response from Plasticity — try again")
         self._update_ui_state()
+
+    def _set_busy(self, busy=True):
+        self._busy = busy
+        if busy:
+            self._busy_since = time.monotonic()
 
     # =========================================================================
     # Commands
@@ -515,7 +533,7 @@ class PlasticityDialog(gui.GeDialog):
 
         # ── Connection ───────────────────────────────────────────────────
         if id == IDS.BTN_CONNECT:
-            if self._busy:
+            if self._busy or self.client.connecting:
                 return True
             self._server = self.GetString(IDS.EDT_SERVER)
             self.client.connect(self._server)
@@ -523,11 +541,11 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_DISCONNECT:
             self.client.disconnect()
 
-        # ── Refresh (v2.1.0: triggers PutSome after list completes) ──────
+        # ── Refresh (uploads the Outbox via PUT_SOME once the list is in) ──
         elif id == IDS.BTN_REFRESH:
             if self._busy:
                 return True
-            self._busy = True
+            self._set_busy()
             self._only_visible = self.GetBool(IDS.CHK_ONLY_VISIBLE)
 
             # Capture local refs for the closure
@@ -557,9 +575,11 @@ class PlasticityDialog(gui.GeDialog):
                                 outbox_data["items"])
 
             if self._only_visible:
-                self.client.list_visible(on_complete)
+                sent = self.client.list_visible(on_complete)
             else:
-                self.client.list_all(on_complete)
+                sent = self.client.list_all(on_complete)
+            if sent is None:
+                self._busy = False
 
         # ── Live Link ────────────────────────────────────────────────────
         elif id == IDS.CHK_LIVELINK:
@@ -586,7 +606,7 @@ class PlasticityDialog(gui.GeDialog):
         elif id == IDS.BTN_REFACET:
             if self._busy:
                 return True
-            self._busy = True
+            self._set_busy()
             self._do_refacet()
 
         # ── Utilities ────────────────────────────────────────────────────
@@ -613,10 +633,19 @@ class PlasticityDialog(gui.GeDialog):
 
     def _update_ui_state(self):
         connected = self.bridge.connected
+        doc = c4d.documents.GetActiveDocument()
+        in_poly_mode = bool(doc and doc.GetMode() == c4d.Mpolygons)
+        state = (connected, self._busy, in_poly_mode, self.client.connecting,
+                 self.bridge.status_message, self.bridge.filename)
+        if state == self._ui_state:
+            return
+        self._ui_state = state
+        connecting = self.client.connecting and not connected
 
-        self.Enable(IDS.BTN_CONNECT,    not connected and not self._busy)
-        self.Enable(IDS.BTN_DISCONNECT, connected)
-        self.Enable(IDS.EDT_SERVER,     not connected)
+        self.Enable(IDS.BTN_CONNECT,    not connected and not connecting
+                                        and not self._busy)
+        self.Enable(IDS.BTN_DISCONNECT, connected or connecting)
+        self.Enable(IDS.EDT_SERVER,     not connected and not connecting)
         self.Enable(IDS.BTN_REFRESH,    connected and not self._busy)
         self.Enable(IDS.CHK_LIVELINK,   connected)
         self.Enable(IDS.SLD_UNIT_SCALE, connected)
@@ -633,8 +662,6 @@ class PlasticityDialog(gui.GeDialog):
         self.Enable(IDS.SLD_CURVE_CHORD_ANG, connected)
         self.Enable(IDS.SLD_SURF_PLANE_TOL,  connected)
         self.Enable(IDS.SLD_SURF_ANGLE_TOL,  connected)
-        doc = c4d.documents.GetActiveDocument()
-        in_poly_mode = bool(doc and doc.GetMode() == c4d.Mpolygons)
         self.Enable(IDS.BTN_STORE_FACES, connected and not self._busy)
         self.Enable(IDS.BTN_STORE_EDGES, connected and not self._busy)
         self.Enable(IDS.BTN_SELECT_FACE, connected and not self._busy and in_poly_mode)
@@ -664,26 +691,33 @@ class PlasticityDialog(gui.GeDialog):
         gui.MessageDialog(f"Connection error:\n{error}")
 
     def _on_operation_complete(self, _: BridgeEvent):
+        # Errors (event.data['error']) are reported in the status line by
+        # the scene handler; either way the operation is over.
+        self._busy = False
+
+    def _on_operation_failed(self, event: BridgeEvent):
+        # The client already wrote the error to the status line.
         self._busy = False
 
     def _on_status_update(self, _: BridgeEvent):
         self._busy = False
 
     def _on_new_version(self, _: BridgeEvent):
-        if self.GetBool(IDS.CHK_LIVELINK) and not self._busy:
-            self._busy = True
-            if self.GetBool(IDS.CHK_ONLY_VISIBLE):
-                self.client.list_visible()
-            else:
-                self.client.list_all()
+        self._auto_refresh()
 
     def _on_new_file(self, _: BridgeEvent):
+        self._auto_refresh()
+
+    def _auto_refresh(self):
+        """Re-import after NEW_VERSION / NEW_FILE while Live Link is on."""
         if self.GetBool(IDS.CHK_LIVELINK) and not self._busy:
-            self._busy = True
+            self._set_busy()
             if self.GetBool(IDS.CHK_ONLY_VISIBLE):
-                self.client.list_visible()
+                sent = self.client.list_visible()
             else:
-                self.client.list_all()
+                sent = self.client.list_all()
+            if sent is None:
+                self._busy = False
 
     # =========================================================================
     # Refacet
@@ -712,38 +746,28 @@ class PlasticityDialog(gui.GeDialog):
         min_width = self.GetFloat(IDS.SLD_MIN_WIDTH)
         max_width = self.GetFloat(IDS.SLD_MAX_WIDTH)
 
-        max_sides       = 3   if self._tri_mode else 128
-        plane_angle     = 0.0 if self._tri_mode else math.pi / 4.0
-        curve_chord_max = max_width * math.sqrt(0.5)
+        kwargs = build_refacet_kwargs(
+            tri_mode=self._tri_mode, advanced=self._advanced_mode,
+            tolerance=tolerance, angle=angle,
+            min_width=min_width, max_width=max_width,
+            curve_chord_tol=self.GetFloat(IDS.SLD_CURVE_CHORD_TOL),
+            curve_chord_angle=self.GetFloat(IDS.SLD_CURVE_CHORD_ANG),
+            surface_plane_tol=self.GetFloat(IDS.SLD_SURF_PLANE_TOL),
+            surface_angle_tol=self.GetFloat(IDS.SLD_SURF_ANGLE_TOL),
+        )
+        cct = kwargs["curve_chord_tolerance"]
+        cca = kwargs["curve_chord_angle"]
+        spt = kwargs["surface_plane_tolerance"]
+        spa = kwargs["surface_plane_angle"]
 
-        if self._advanced_mode:
-            cct = self.GetFloat(IDS.SLD_CURVE_CHORD_TOL)
-            cca = self.GetFloat(IDS.SLD_CURVE_CHORD_ANG)
-            spt = self.GetFloat(IDS.SLD_SURF_PLANE_TOL)
-            spa = self.GetFloat(IDS.SLD_SURF_ANGLE_TOL)
-        else:
-            cct = tolerance
-            cca = angle
-            spt = tolerance
-            spa = angle
-
+        sent = 0
         for filename, obj_ids in by_filename.items():
-            self.client.refacet_some(
-                filename              = filename,
-                plasticity_ids        = obj_ids,
-                relative_to_bbox      = True,
-                curve_chord_tolerance = cct,
-                curve_chord_angle     = cca,
-                surface_plane_tolerance = spt,
-                surface_plane_angle   = spa,
-                match_topology        = True,
-                max_sides             = max_sides,
-                plane_angle           = plane_angle,
-                min_width             = min_width,
-                max_width             = max_width,
-                curve_chord_max       = curve_chord_max,
-                shape                 = FacetShapeType.CUT,
-            )
+            if self.client.refacet_some(filename=filename,
+                                        plasticity_ids=obj_ids,
+                                        **kwargs) is not None:
+                sent += 1
+        if not sent:
+            self._busy = False
 
         # ── Auto-Refacet tag creation / update ───────────────────────────
         if self.GetBool(IDS.CHK_AUTO_REFACET):
@@ -862,14 +886,20 @@ class PlasticityDialog(gui.GeDialog):
                 "Select one or more Plasticity mesh objects first.")
 
     # =========================================================================
-    # Layout restore and cleanup
+    # Cleanup
     # =========================================================================
 
-    def RestoreLayout(self, pluginid, secret):
-        return self.Restore(pluginid=pluginid, secret=secret)
-
     def DestroyWindow(self):
+        """Closing the dialog disconnects from Plasticity.
+
+        The timer that drains the event queue lives in this dialog, so a
+        connection without the dialog would only pile up events.  Cinema 4D
+        also calls this on layout switches.  ``disconnect()`` does not block;
+        the background thread winds down on its own and the next Connect
+        starts a fresh session.
+        """
         self.SetTimer(0)
-        if self.bridge.connected:
-            self.client.disconnect()
+        self._ui_state = None
+        self._busy = False
+        self.client.disconnect()
         return super().DestroyWindow()

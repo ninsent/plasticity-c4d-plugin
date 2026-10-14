@@ -1,0 +1,55 @@
+name: Release
+
+# Manual only: nothing is ever released by a push or a tag.  To publish,
+# open Actions → Release → "Run workflow" and enter an existing tag
+# (e.g. v1.2.0).  The build also refuses unless the tag matches
+# core/version.py and CHANGELOG.md has a dated "## [X.Y.Z] - YYYY-MM-DD"
+# section for that version.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v1.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build release zip
+        run: >
+          python scripts/build_release.py --release
+          --tag "$TAG" --notes dist/RELEASE_NOTES.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="dist/PlasticityBridge_${TAG}.zip"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$zip" --clobber
+            gh release edit "$TAG" --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "$TAG" "$zip" \
+              --title "PlasticityBridge ${TAG}" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi

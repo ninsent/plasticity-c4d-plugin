@@ -11,12 +11,18 @@ License:    MIT
 
 Installation
 ------------
-Copy this entire folder to your Cinema 4D plugins directory:
+Copy this entire PlasticityBridge folder to your Cinema 4D plugins directory:
 
   Windows:  %APPDATA%\Maxon\Cinema 4D\plugins\
   macOS:    ~/Library/Application Support/Maxon/Cinema 4D/plugins/
 
-Restart Cinema 4D. The plugin appears under Extensions > Plasticity Bridge.
+Restart Cinema 4D. The plugin appears under Extensions > Plasticity Bridge,
+and the Console shows "[Plasticity Bridge] <version> registered".
+
+To upgrade, quit Cinema 4D and replace the old PlasticityBridge folder with
+this one (delete the old folder first).
+
+Closing the Plasticity Bridge window disconnects from Plasticity.
 
 Requirements
 ------------
@@ -32,3 +38,8 @@ Usage
 
 For full documentation, visit:
 https://github.com/ninsent/plasticity-c4d-plugin
+
+Third-party code
+----------------
+libs/websockets: websockets 10.4, (c) Aymeric Augustin and contributors,
+BSD 3-Clause license - see libs/websockets/LICENSE.

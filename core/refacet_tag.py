@@ -14,8 +14,10 @@ import c4d
 import math
 from c4d import plugins
 
+from core.refacet_settings import build_refacet_kwargs
+
 # ---------------------------------------------------------------------------
-# Plugin ID — replace with a properly registered ID from plugincafe.maxon.net
+# Plugin ID — registered with Maxon.  Never change: scenes store tags by ID.
 # ---------------------------------------------------------------------------
 TAG_PLUGIN_ID = 1068209
 
@@ -54,42 +56,18 @@ def read_tag_refacet_kwargs(tag):
 
     Returns a dict ready to be unpacked with ``**kwargs``.
     """
-    tri_mode = tag[PREF_TOPOLOGY] == PREF_TOPOLOGY_TRIS
-    advanced = tag[PREF_OPTIONS_MODE] == PREF_OPTIONS_ADVANCED
-
-    max_sides   = 3   if tri_mode else 128
-    plane_angle = 0.0 if tri_mode else math.pi / 4.0
-
-    if advanced:
-        cct = tag[PREF_CURVE_CHORD_TOL]
-        cca = tag[PREF_CURVE_CHORD_ANG]
-        spt = tag[PREF_SURF_PLANE_TOL]
-        spa = tag[PREF_SURF_ANGLE_TOL]
-    else:
-        tolerance = tag[PREF_TOLERANCE]
-        angle     = tag[PREF_ANGLE]
-        cct = tolerance
-        cca = angle
-        spt = tolerance
-        spa = angle
-
-    min_width       = tag[PREF_MIN_WIDTH]
-    max_width       = tag[PREF_MAX_WIDTH]
-    curve_chord_max = max_width * math.sqrt(0.5)
-
-    return {
-        "relative_to_bbox":       True,
-        "curve_chord_tolerance":  cct,
-        "curve_chord_angle":      cca,
-        "surface_plane_tolerance": spt,
-        "surface_plane_angle":    spa,
-        "match_topology":         True,
-        "max_sides":              max_sides,
-        "plane_angle":            plane_angle,
-        "min_width":              min_width,
-        "max_width":              max_width,
-        "curve_chord_max":        curve_chord_max,
-    }
+    return build_refacet_kwargs(
+        tri_mode=tag[PREF_TOPOLOGY] == PREF_TOPOLOGY_TRIS,
+        advanced=tag[PREF_OPTIONS_MODE] == PREF_OPTIONS_ADVANCED,
+        tolerance=tag[PREF_TOLERANCE],
+        angle=tag[PREF_ANGLE],
+        min_width=tag[PREF_MIN_WIDTH],
+        max_width=tag[PREF_MAX_WIDTH],
+        curve_chord_tol=tag[PREF_CURVE_CHORD_TOL],
+        curve_chord_angle=tag[PREF_CURVE_CHORD_ANG],
+        surface_plane_tol=tag[PREF_SURF_PLANE_TOL],
+        surface_angle_tol=tag[PREF_SURF_ANGLE_TOL],
+    )
 
 
 # ===================================================================

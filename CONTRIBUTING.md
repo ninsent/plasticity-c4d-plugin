@@ -31,29 +31,62 @@ git checkout -b feature/your-feature-name
 - Add docstrings to all public methods
 - Keep methods focused — prefer small, single-purpose functions
 
+### Tests
+The suite runs outside Cinema 4D: `tests/stubs/c4d` is a small stand-in for the `c4d` module, and `tests/reference/` holds frozen copies of the 1.1.6 code and the Blender addon's wire layouts that new code is compared against.
+
+```bash
+python -m pip install -r requirements-dev.txt   # dev only — never shipped
+python -m pytest
+python tests/perf/bench.py --sizes 100000       # optional: before/after timings
+```
+
+- Keep geometry and protocol logic in the c4d-free modules (`core/geometry.py`, `core/protocol.py`, `core/refacet_settings.py`) so it can be tested; the C4D-facing code in `core/handler.py` should stay a thin layer.
+- Add a regression test for every bug fix. Behaviour that can only be checked inside Cinema 4D has to be tested by hand before a release.
+- CI runs the tests on Python 3.9, 3.10 and 3.11 — the Python versions embedded in Cinema 4D 2023.0/2023.1, 2023.2 and 2024–2026 — so don't use newer syntax.
+
+### Compatibility rules
+- Never change the plugin IDs (`1066929`, `1068209`), the `BC_PLASTICITY_*` BaseContainer keys (`1066930`–`1066942`), the managed tag names, or the tag description IDs in `res/description/tplasticityrefacet.h` — they are stored in users' scenes.
+- The wire protocol must stay byte-compatible with the [Plasticity Blender Bridge](https://github.com/nkallen/plasticity-blender-addon); `tests/test_protocol.py` pins it with golden bytes.
+- Only the main thread may touch the C4D API; the WebSocket client talks to it exclusively through `ThreadingBridge` events.
+
 ### Pull Requests
 1. Update `CHANGELOG.md` under an `[Unreleased]` section
-2. Submit a PR with a clear description:
+2. Make sure `python -m pytest` passes
+3. Submit a PR with a clear description:
    - What changed
    - Why it was changed
-   - How to test the changes
+   - How to test the changes (including any manual checks in Cinema 4D)
+
+### Releases
+1. Bump `__version__` in `core/version.py` (the single source of truth — the plugin prints it on load, the build script names the zip after it).
+2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD` and start a new empty `## [Unreleased]` above it.
+3. Build and check locally:
+   ```bash
+   python scripts/build_release.py --release
+   ```
+   This writes `dist/PlasticityBridge_vX.Y.Z.zip` (one top-level `PlasticityBridge/` folder, allowlisted runtime files only), byte-compiles every Python file, and prints the size and SHA-256. Rebuilding the same commit gives a byte-identical zip. Without `--release`, a build of an unreleased version is allowed if its changes are described under `[Unreleased]`.
+4. Test that zip by hand in Cinema 4D.
+5. Push a tag `vX.Y.Z`, then run the *Release* workflow by hand (*Actions → Release → Run workflow*, enter the tag). It runs the tests, checks that the tag matches `core/version.py`, rebuilds the zip and publishes it on the GitHub Release with the matching CHANGELOG section as release notes. Pushing commits or tags never publishes anything on its own.
 
 ### Project Structure
 ```
-plasticity-bridge-c4d/
-├── plasticity_c4d.pyp         # Plugin entry point, command registration, tag registration
+plasticity-c4d-plugin/
+├── plasticity_c4d.pyp         # Plugin entry point, imports, command and tag registration
 ├── dialogs/
 │   ├── __init__.py
 │   └── main_dialog.py         # UI layout, state, and user commands
 ├── core/
 │   ├── __init__.py
-│   ├── client.py              # WebSocket client (handshake, send/recv, async loop)
-│   ├── handler.py             # Scene handler: geometry, hierarchy, utilities, auto-refacet
+│   ├── client.py              # WebSocket client (handshake, non-blocking sends, async loop)
+│   ├── geometry.py            # c4d-free geometry: conversion, N-gons, normals, face maps, export
+│   ├── handler.py             # Scene handler: C4D objects, hierarchy, undo, utilities, auto-refacet
 │   ├── protocol.py            # Binary protocol encoding/decoding (all message types)
-│   ├── refacet_tag.py         # Auto-Refacet TagData plugin and settings helper
-│   └── threading_bridge.py    # Thread-safe event bridge to main thread
+│   ├── refacet_settings.py    # Refacet settings → request parameters (dialog and tag)
+│   ├── refacet_tag.py         # Auto-Refacet TagData plugin
+│   ├── threading_bridge.py    # Thread-safe event bridge to main thread
+│   └── version.py             # Plugin version (single source of truth)
 ├── libs/
-│   └── websockets/            # Bundled websockets library
+│   └── websockets/            # Bundled websockets 10.4 (BSD license in libs/websockets/LICENSE)
 ├── res/
 │   ├── icon.tif               # Plugin icon (also used for the tag)
 │   ├── c4d_symbols.h
@@ -64,6 +97,10 @@ plasticity-bridge-c4d/
 │       ├── c4d_strings.str
 │       └── description/
 │           └── tplasticityrefacet.str  # Auto-Refacet tag display names
+├── tests/                     # pytest suite (c4d stub, references, fake server) — not shipped
+├── scripts/build_release.py   # Release zip builder — not shipped
+├── .github/workflows/         # CI (tests) and the manual release workflow
+├── AUDIT.md
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
 └── README.md
@@ -71,10 +108,11 @@ plasticity-bridge-c4d/
 
 ### Key Modules
 
-- **`protocol.py`** — Binary encoder/decoder matching the Blender addon's wire format. All message types from `HANDSHAKE_1` through `PUT_SOME_1`.
-- **`client.py`** — Async WebSocket client running in a background thread. Sends handshake on connect, dispatches parsed messages as typed `BridgeEvent`s.
-- **`threading_bridge.py`** — Lock-protected queue + callback registry. The dialog's `Timer()` drains it on the main thread.
-- **`handler.py`** — The core scene handler. In-place geometry updates, tri/N-gon paths, ear-clipping triangulation, `MCOMMAND_MELT` with polygon-identity hashing, Inbox/Outbox hierarchy, auto-refacet triggering, and all utility operations.
+- **`protocol.py`** — Binary encoder/decoder matching the Blender addon's wire format. All message types from `HANDSHAKE_1` through `PUT_SOME_1`; bounds-checked, array-based bulk reads.
+- **`client.py`** — Async WebSocket client running in a background thread. Sends handshake on connect, dispatches parsed messages as typed `BridgeEvent`s; all requests are non-blocking and report failures as `OPERATION_FAILED` events.
+- **`threading_bridge.py`** — Unbounded lock-protected queue + callback registry. The dialog's `Timer()` drains it on the main thread with a time budget.
+- **`geometry.py`** — Everything geometric that doesn't need Cinema 4D: coordinate conversion, welding, ear clipping, N-gon outline reconstruction, normal tag data, poly-face map encoding, edge maps, PUT_SOME payloads.
+- **`handler.py`** — The scene handler. In-place geometry updates, `MCOMMAND_MELT` with polygon-identity hashing, Inbox/Outbox hierarchy, undo steps, control-cage resolution, auto-refacet triggering, and all utility operations.
 - **`refacet_tag.py`** — `PlasticityRefacetTag` TagData subclass. Stores refacet settings, hides Simple/Advanced parameter groups via `GetDDescription`, exposes `read_tag_refacet_kwargs()` for the handler.
 - **`main_dialog.py`** — 3-tab QuickTab UI (Server, Basic, Utilities) with all refacet, selection, and utility controls.
 

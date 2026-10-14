@@ -1,74 +1,76 @@
 """
 Scene handler for creating and updating Cinema 4D objects from Plasticity data.
 
-KEY DESIGN: When updating an existing object, geometry is replaced IN-PLACE via
-ResizeObject() + SetPoint/SetPolygon. This preserves the C4D object identity,
-keeping all user-assigned tags (materials, textures, selections), animation
-tracks, constraints, and scene references intact — matching the Blender addon's
-mesh.clear_geometry() + refill approach.
+This is the C4D-facing layer.  The geometry itself (coordinate conversion,
+welding, ear clipping, N-gon grouping, normals, poly-face maps, edge maps,
+PUT_SOME payloads) lives in the c4d-free ``core.geometry`` module; the
+methods here turn its results into objects, tags and undo steps.
 
-Only Plasticity-managed tags (NormalTag, named "__plasticity_normals__") are
-stripped and recreated on each update. User-added tags are never touched.
+KEY DESIGN: When updating an existing object, geometry is replaced IN-PLACE via
+ResizeObject() + SetAllPoints()/SetPolygon(). This preserves the C4D object
+identity, keeping all user-assigned tags (materials, textures, selections),
+animation tracks, constraints, and scene references intact — matching the
+Blender addon's mesh.clear_geometry() + refill approach.
+
+Only Plasticity-managed tags are touched: the NormalTag named
+"__plasticity_normals__" is rebuilt on every update; the "Plasticity Face <n>"
+and "__plasticity_edges__" selection tags are removed (their indices would be
+stale) and are recreated by the Store utilities.  User tags are never touched.
 
 N-GON APPROACH (refacet path only):
-  Plasticity sends N-gon data as: a 'faces' membership array paired with an
-  'indices' array. Each consecutive run of equal values in 'faces' defines one
-  polygon's vertices (which may have 3, 4, or more corners).
+  Plasticity sends N-gon data as a 'faces' membership array paired with an
+  'indices' array; each run of equal values in 'faces' is one polygon.
+  Tris/quads are written directly, larger polygons are ear-clipped and then
+  merged back into true C4D N-gons with MCOMMAND_MELT.  Ferdinand's
+  polygon-identity hashing (Maxon Developer Forum) keeps the melt correct when
+  indices shift after each successive melt.  The object's polygon selection
+  is saved before and restored after melting.
 
-  I build the object with fan-triangulated triangles, then use
-  MCOMMAND_MELT on polygon selections to merge the triangle groups back into
-  proper C4D N-gons. Ferdinand's polygon-identity hashing approach (from the
-  Maxon Developer Forum) is used to keep the melt correct when indices shift
-  after each successive melt operation.
-
-NORMALS IN N-GON MODE:
-  The melt operation changes the polygon topology, invalidating any pre-built
-  NormalTag.  The solution is to pre-compute a corner_normals dict keyed by
-  (welded_vertex_index, group_index) during triangulation — before the melt.
-  After melt, each post-melt polygon is mapped back to its Plasticity group
-  via vertex-identity tracking, then the NormalTag is rebuilt from the dict.
-  This gives identical normal quality in both tri and N-gon modes.
+NORMALS:
+  Written straight into the NormalTag's low-level buffer: 12 int16 per
+  polygon, scaled by 32000 (Maxon forum, topic 11584).  In N-gon mode they
+  are rebuilt after the melt from a (welded vertex, group) → normal map.
 
 POLY-FACE MAP (BC_PLASTICITY_POLY_FACE_MAP):
-  A JSON list stored on each mesh object, one entry per C4D polygon, giving
-  the Plasticity group index (0-based into face_ids) that the polygon belongs
-  to.  Computed at import time for tri mode, or after melt for N-gon mode.
-  This is the single source of truth for all downstream consumers (utilities,
-  normal reconstruction, etc.) — no loop-range arithmetic required.
+  The Plasticity group (CAD face) index of every C4D polygon.  Stored
+  run-length encoded; maps written by 1.1.x (a JSON list) are still read.
 
 COORDINATE SYSTEM: Plasticity is Z-up, C4D is Y-up.
   C4D X = Plasticity X,  C4D Y = Plasticity Z,  C4D Z = Plasticity Y.
-  Applied identically to vertex positions and normals.
 
-WINDING ORDER: Reversed — CPolygon(a, c, b) instead of (a, b, c) to match
-  C4D's counter-clockwise front-face convention.
+WINDING ORDER: Reversed — CPolygon(a, c, b) instead of (a, b, c).
 
 UNIT SCALE: Lives on the root null's scale transform, not baked into vertices.
-  update_unit_scale() propagates changes to all root nulls instantly.
 
-HIERARCHY (v2.1.0):
+HIERARCHY:
   Root null (per filename)
     ├── Outbox null (BC_PLASTICITY_OUTBOX) — user places SDS objects here
     └── Inbox null (BC_PLASTICITY_INBOX)  — Plasticity objects land here
 
-  Outbox is first child, Inbox is second.  Objects in the Outbox are
-  protected from incoming updates and can be uploaded to Plasticity via
-  the PUT_SOME_1 protocol message.
+UNDO:
+  Every incoming update (list, transaction, refacet) is exactly one undo
+  step, like the Blender bridge.  The step is opened lazily, so updates that
+  change nothing leave no empty step.  Undoing a Live Link step reverts the
+  C4D copy to the previous Plasticity state; the next update or a Refresh
+  resyncs it.  Remote changes are deliberately not made invisible to the
+  undo system: removing or changing scene objects behind its back can leave
+  the undo stack referring to states it never recorded.
 """
 
-import c4d
-import array
-import bisect
+import contextlib
 import json
 import math
 import uuid
-from typing import Dict, List, Optional, Any, Set, Tuple
 
-from core.protocol import ObjectType, MessageType
+import c4d
+
+from core import geometry as geo
+from core.protocol import ObjectType, MessageType, LIST_TYPES
 from core.threading_bridge import ThreadingBridge, BridgeEvent, EventType
 from core.refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
 
-# BaseContainer keys — offsets from registered plugin ID 1066929
+# BaseContainer keys — offsets from registered plugin ID 1066929.
+# Never change these: they are stored in users' scenes.
 PLUGIN_ID              = 1066929
 BC_PLASTICITY_ID       = PLUGIN_ID + 1   # 1066930
 BC_PLASTICITY_FILENAME = PLUGIN_ID + 2   # 1066931
@@ -76,7 +78,7 @@ BC_PLASTICITY_GROUPS   = PLUGIN_ID + 3   # 1066932
 BC_PLASTICITY_FACE_IDS = PLUGIN_ID + 4   # 1066933
 BC_PLASTICITY_ROOT     = PLUGIN_ID + 5   # 1066934
 BC_PLASTICITY_POLY_FACE_MAP = PLUGIN_ID + 6   # 1066935
-# v2.1.0 additions
+# Added in 1.1.0 (Inbox/Outbox, PUT_SOME)
 BC_PLASTICITY_INBOX         = PLUGIN_ID + 7    # 1066936
 BC_PLASTICITY_OUTBOX        = PLUGIN_ID + 8    # 1066937
 BC_PLASTICITY_PNS_ID        = PLUGIN_ID + 9    # 1066938  (persistent string ID for outbox items)
@@ -90,216 +92,40 @@ MANAGED_FACE_SEL_PREFIX  = "Plasticity Face "
 MANAGED_EDGES_TAG_NAME   = "__plasticity_edges__"
 
 # Plasticity sends vertex positions in metres; C4D's internal unit is
-# centimetres.  Multiply every incoming coordinate by this factor so the
-# geometry appears at the correct size *before* the user's unit_scale is
-# applied on the root null.
-_IMPORT_SCALE = 100.0
+# centimetres (see core.geometry.IMPORT_SCALE).
+_IMPORT_SCALE = geo.IMPORT_SCALE
 
 # PutSome options bitfield constants
 _KIND_MESH = 0
 _KIND_SUBD = 1
 
-
-# =============================================================================
-# Ear-clipping triangulation for concave N-gons
-# =============================================================================
-
-def _cross_2d(ax, ay, bx, by, px, py):
-    """Signed area ×2 of triangle ABP.  Positive if P is left of A→B (CCW)."""
-    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-
-
-def _point_in_triangle_2d(px, py, ax, ay, bx, by, cx, cy):
-    """True if point P is inside or on the boundary of triangle ABC."""
-    d1 = _cross_2d(ax, ay, bx, by, px, py)
-    d2 = _cross_2d(bx, by, cx, cy, px, py)
-    d3 = _cross_2d(cx, cy, ax, ay, px, py)
-    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
-    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-    return not (has_neg and has_pos)
-
-
-def _compute_polygon_normal(pts):
-    """
-    Newell's method — robust face normal from an ordered 3D point ring.
-    Works for non-planar and concave polygons.  Returns a unit c4d.Vector.
-    """
-    nx = ny = nz = 0.0
-    n = len(pts)
-    for i in range(n):
-        c = pts[i]
-        nxt = pts[(i + 1) % n]
-        nx += (c.y - nxt.y) * (c.z + nxt.z)
-        ny += (c.z - nxt.z) * (c.x + nxt.x)
-        nz += (c.x - nxt.x) * (c.y + nxt.y)
-    length = (nx * nx + ny * ny + nz * nz) ** 0.5
-    if length < 1e-12:
-        return c4d.Vector(0, 1, 0)
-    return c4d.Vector(nx / length, ny / length, nz / length)
-
-
-def _project_to_2d(pts, normal):
-    """
-    Flatten 3D points to 2D by dropping the axis most aligned with the
-    polygon normal.  Returns a list of (u, v) tuples.
-    """
-    ax = abs(normal.x)
-    ay = abs(normal.y)
-    az = abs(normal.z)
-    if ax >= ay and ax >= az:
-        return [(p.y, p.z) for p in pts]
-    elif ay >= az:
-        return [(p.x, p.z) for p in pts]
-    else:
-        return [(p.x, p.y) for p in pts]
-
-
-def _is_convex(pts_2d):
-    """
-    Quick O(n) convexity test.  Returns True if the polygon is strictly
-    convex (all cross products have the same sign).
-    """
-    n = len(pts_2d)
-    if n < 3:
-        return False
-    sign = 0
-    for i in range(n):
-        ax, ay = pts_2d[i]
-        bx, by = pts_2d[(i + 1) % n]
-        cx, cy = pts_2d[(i + 2) % n]
-        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-        if cross > 1e-12:
-            if sign < 0:
-                return False
-            sign = 1
-        elif cross < -1e-12:
-            if sign > 0:
-                return False
-            sign = -1
-    return sign != 0
-
-
-def _ear_clip(pts_2d):
-    """
-    Ear-clipping triangulation for a simple (possibly concave) polygon.
-
-    Args:
-        pts_2d: list of (x, y) coordinate tuples — the polygon perimeter
-                in order.
-
-    Returns:
-        List of (i, j, k) index triples into pts_2d.  Each triple is one
-        triangle.  Returns [] on degenerate input (< 3 vertices).
-    """
-    n = len(pts_2d)
-    if n < 3:
-        return []
-    if n == 3:
-        return [(0, 1, 2)]
-
-    # Fast-path: convex polygon → simple fan triangulation (very common
-    # for CAD-tessellated output from Plasticity).
-    if _is_convex(pts_2d):
-        return [(0, i + 1, i + 2) for i in range(n - 2)]
-
-    # Signed area → winding direction
-    area = 0.0
-    for i in range(n):
-        j = (i + 1) % n
-        area += pts_2d[i][0] * pts_2d[j][1]
-        area -= pts_2d[j][0] * pts_2d[i][1]
-    if abs(area) < 1e-12:
-        return []                       # degenerate (zero-area) polygon
-    ccw = area > 0.0
-
-    # Pre-extract coordinates for fast access (avoid repeated tuple indexing)
-    xs = [p[0] for p in pts_2d]
-    ys = [p[1] for p in pts_2d]
-
-    remaining = list(range(n))          # indices into pts_2d still alive
-    triangles = []
-
-    # Build initial reflex vertex set (only reflex vertices can block ears)
-    reflex = set()
-    for i in range(n):
-        pi = remaining[(i - 1) % n]
-        ci = remaining[i]
-        ni = remaining[(i + 1) % n]
-        cross = _cross_2d(xs[pi], ys[pi], xs[ci], ys[ci], xs[ni], ys[ni])
-        if (ccw and cross <= 0) or (not ccw and cross >= 0):
-            reflex.add(ci)
-
-    max_iter = n * n                    # safety cap
-
-    for _ in range(max_iter):
-        m = len(remaining)
-        if m < 3:
-            break
-        if m == 3:
-            triangles.append(tuple(remaining))
-            break
-
-        found_ear = False
-        for i in range(m):
-            ci = remaining[i]
-            if ci in reflex:
-                continue                # reflex vertex can't be an ear tip
-
-            pi = remaining[(i - 1) % m]
-            ni = remaining[(i + 1) % m]
-
-            pix, piy = xs[pi], ys[pi]
-            cix, ciy = xs[ci], ys[ci]
-            nix, niy = xs[ni], ys[ni]
-
-            # Containment test: only check reflex vertices (they are the
-            # only ones that can be inside the ear triangle).
-            is_ear = True
-            for ri in reflex:
-                if ri == pi or ri == ci or ri == ni:
-                    continue
-                if _point_in_triangle_2d(
-                    xs[ri], ys[ri], pix, piy, cix, ciy, nix, niy,
-                ):
-                    is_ear = False
-                    break
-
-            if is_ear:
-                triangles.append((pi, ci, ni))
-                remaining.pop(i)
-                reflex.discard(ci)
-
-                # Neighbours may have changed convexity — update reflex set
-                m2 = len(remaining)
-                if m2 >= 3:
-                    for check_i in (
-                        remaining.index(pi) if pi in remaining else -1,
-                        remaining.index(ni) if ni in remaining else -1,
-                    ):
-                        if check_i < 0:
-                            continue
-                        p2 = remaining[(check_i - 1) % m2]
-                        c2 = remaining[check_i]
-                        n2 = remaining[(check_i + 1) % m2]
-                        cross = _cross_2d(
-                            xs[p2], ys[p2], xs[c2], ys[c2], xs[n2], ys[n2])
-                        if (ccw and cross <= 0) or (not ccw and cross >= 0):
-                            reflex.add(c2)
-                        else:
-                            reflex.discard(c2)
-
-                found_ear = True
-                break
-
-        if not found_ear:
-            break                       # stuck — degenerate remainder
-
-    return triangles
+_PHONG_ANGLE_DEG = 40
 
 
 # =============================================================================
 # Shared utility functions for reading Plasticity metadata from objects
 # =============================================================================
+
+def _poly_tuples(obj):
+    return [(cp.a, cp.b, cp.c, cp.d) for cp in obj.GetAllPolygons()]
+
+
+def _read_poly_face_map(obj):
+    """Validated (poly_face_map, poly_count) of a Plasticity polygon object,
+    or None.  Reads both the run-length format and 1.1.x JSON lists; corrupt
+    data yields None instead of raising."""
+    if not obj.CheckType(c4d.Opolygon):
+        return None
+    bc = obj.GetDataInstance()
+    if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+        return None
+    poly_face_map = geo.decode_poly_face_map(
+        bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, ""))
+    poly_count = obj.GetPolygonCount()
+    if poly_count == 0 or not poly_face_map:
+        return None
+    return poly_face_map, poly_count
+
 
 def _get_poly_face_map(obj):
     """Read and validate the poly-face map from a Plasticity polygon object.
@@ -307,47 +133,23 @@ def _get_poly_face_map(obj):
     Returns (poly_face_map, face_ids, poly_count) on success, or None if the
     object is not a valid Plasticity polygon object or has no map data.
     """
-    if not obj.CheckType(c4d.Opolygon):
+    result = _read_poly_face_map(obj)
+    if result is None:
         return None
-
-    bc = obj.GetDataInstance()
-    if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
+    poly_face_map, poly_count = result
+    try:
+        face_ids = json.loads(obj.GetDataInstance().GetString(
+            BC_PLASTICITY_FACE_IDS, "") or "null")
+    except ValueError:
         return None
-
-    pfm_str      = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-    face_ids_str = bc.GetString(BC_PLASTICITY_FACE_IDS, "")
-    if not pfm_str or not face_ids_str:
+    if not face_ids or not isinstance(face_ids, list):
         return None
-
-    poly_face_map = json.loads(pfm_str)
-    face_ids      = json.loads(face_ids_str)
-
-    poly_count = obj.GetPolygonCount()
-    if poly_count == 0 or not poly_face_map or not face_ids:
-        return None
-
     return poly_face_map, face_ids, poly_count
 
 
 def _get_poly_face_map_only(obj):
     """Like _get_poly_face_map but doesn't require face_ids."""
-    if not obj.CheckType(c4d.Opolygon):
-        return None
-
-    bc = obj.GetDataInstance()
-    if bc.GetInt32(BC_PLASTICITY_ID, 0) == 0:
-        return None
-
-    pfm_str = bc.GetString(BC_PLASTICITY_POLY_FACE_MAP, "")
-    if not pfm_str:
-        return None
-
-    poly_face_map = json.loads(pfm_str)
-    poly_count = obj.GetPolygonCount()
-    if poly_count == 0 or not poly_face_map:
-        return None
-
-    return poly_face_map, poly_count
+    return _read_poly_face_map(obj)
 
 
 def _build_edge_map(obj, poly_face_map, poly_count):
@@ -355,29 +157,40 @@ def _build_edge_map(obj, poly_face_map, poly_count):
 
     Returns a dict: (min_vertex, max_vertex) → [(poly_idx, slot, group_idx), ...]
     """
-    edge_map = {}
-    map_len  = min(len(poly_face_map), poly_count)
+    return geo.build_edge_map(_poly_tuples(obj), poly_face_map, poly_count)
 
-    for poly_idx in range(map_len):
-        group_idx = poly_face_map[poly_idx]
-        cp        = obj.GetPolygon(poly_idx)
-        is_tri    = (cp.c == cp.d)
 
-        edge_slots = [
-            (0, cp.a, cp.b),
-            (1, cp.b, cp.c),
-            (3, cp.d, cp.a),
-        ]
-        if not is_tri:
-            edge_slots.append((2, cp.c, cp.d))
+def _write_lowlevel(buf, raw):
+    """Copy raw bytes into a variable tag's low-level buffer.  Returns False
+    if the buffer is missing or too small (caller falls back)."""
+    if buf is None:
+        return False
+    mv = memoryview(buf)
+    if mv.format != "B" or mv.ndim != 1:
+        mv = mv.cast("B")
+    if len(mv) < len(raw):
+        return False
+    mv[:len(raw)] = raw
+    return True
 
-        for slot, v1, v2 in edge_slots:
-            key = (min(v1, v2), max(v1, v2))
-            if key not in edge_map:
-                edge_map[key] = []
-            edge_map[key].append((poly_idx, slot, group_idx))
 
-    return edge_map
+class _UndoStep:
+    """One document undo step, opened lazily on the first ``add``."""
+
+    def __init__(self, doc):
+        self.doc = doc
+        self.open = False
+
+    def add(self, undotype, obj):
+        if not self.open:
+            self.doc.StartUndo()
+            self.open = True
+        self.doc.AddUndo(undotype, obj)
+
+    def close(self):
+        if self.open:
+            self.open = False
+            self.doc.EndUndo()
 
 
 class SceneHandler:
@@ -389,11 +202,22 @@ class SceneHandler:
         self._groups = {}   # (filename, id) -> c4d.BaseObject  (null groups)
         self._roots  = {}   # filename       -> c4d.BaseObject  (root nulls)
 
-        # Persistent set of all Plasticity IDs returned by PUT_SOME responses.
-        # Prevents uploaded objects from being re-imported on subsequent refreshes.
-        self._uploaded_ids = set()
+        # Plasticity IDs returned by PUT_SOME responses this session, per
+        # Plasticity file (IDs are small per-file integers), so uploaded
+        # objects are not re-imported:  filename -> (item_ids, group_ids).
+        # Items and groups have overlapping ID spaces and are kept apart.
+        self._uploaded = {}
+        # Plasticity file the last Outbox upload belongs to (the PUT_SOME
+        # response does not say).
+        self._upload_filename = None
 
-        # v2.1.0: back-reference to client (set in plasticity_c4d.pyp)
+        # Auto-Refacet: incoming tri geometry kept aside for tagged objects
+        # until their refacet response arrives ((filename, id) -> item).
+        self._pending_auto_refacet = {}
+
+        self._undo = None   # current _UndoStep while an update runs
+
+        # Back-reference to the client (set in plasticity_c4d.pyp)
         self.client = None
 
         bridge.register_callback(EventType.CONNECTED,           self._on_connected)
@@ -403,9 +227,9 @@ class SceneHandler:
         bridge.register_callback(EventType.REFACET_RESPONSE,    self._on_refacet_response)
         bridge.register_callback(EventType.NEW_VERSION,         self._on_new_version)
         bridge.register_callback(EventType.NEW_FILE,            self._on_new_file)
-        # v2.1.0
         bridge.register_callback(EventType.HANDSHAKE_RESPONSE,  self._on_handshake)
         bridge.register_callback(EventType.PUT_SOME_RESPONSE,   self._on_put_some)
+        bridge.register_callback(EventType.OPERATION_FAILED,    self._on_operation_failed)
 
     # =========================================================================
     # Connection lifecycle
@@ -421,12 +245,64 @@ class SceneHandler:
         self._items.clear()
         self._groups.clear()
         self._roots.clear()
-        self._uploaded_ids.clear()
+        self._uploaded.clear()
+        self._upload_filename = None
+        self._pending_auto_refacet.clear()
 
     def on_disconnect(self):
+        # A refacet that was still in flight will never arrive: give
+        # Auto-Refacet objects the geometry kept aside for them.
+        doc = c4d.documents.GetActiveDocument()
+        if doc and self._pending_auto_refacet:
+            self._apply_pending_auto_refacet(
+                doc, list(self._pending_auto_refacet))
+        self._pending_auto_refacet.clear()
         self._items.clear()
         self._groups.clear()
         self._roots.clear()
+
+    def _on_operation_failed(self, event: BridgeEvent):
+        """A request could not be sent or its response was unreadable."""
+        operation = (event.data or {}).get('operation')
+        if operation == MessageType.REFACET_SOME_1:
+            doc = c4d.documents.GetActiveDocument()
+            if doc and self._pending_auto_refacet:
+                self._apply_pending_auto_refacet(
+                    doc, list(self._pending_auto_refacet))
+        elif operation in LIST_TYPES and self.client:
+            # Don't let the Refresh upload fire on some later list.
+            self.client.on_list_complete = None
+
+    def _uploaded_for(self, filename):
+        ids = self._uploaded.get(filename)
+        if ids is None:
+            ids = self._uploaded[filename] = (set(), set())
+        return ids
+
+    # =========================================================================
+    # Undo helpers
+    # =========================================================================
+
+    @contextlib.contextmanager
+    def _undo_step(self, doc):
+        """Group everything inside into (at most) one undo step."""
+        if self._undo is not None:            # nested: join the outer step
+            yield self._undo
+            return
+        step = _UndoStep(doc)
+        self._undo = step
+        try:
+            yield step
+        finally:
+            self._undo = None
+            step.close()
+
+    def _add_undo(self, doc, undotype, obj):
+        if self._undo is not None and self._undo.doc is doc:
+            self._undo.add(undotype, obj)
+        else:
+            with self._undo_step(doc) as step:
+                step.add(undotype, obj)
 
     # =========================================================================
     # Deferred N-gon processing
@@ -449,72 +325,76 @@ class SceneHandler:
         data = event.data
         if not data:
             return
+        if data.get('error'):
+            self.bridge.status_message = (
+                f"Error: Refresh failed (Plasticity returned {data['error']})")
+            if self.client:
+                self.client.on_list_complete = None
+            return
         filename = data.get('filename', '')
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return
 
-        deferred_ngons = []
+        all_objects = data.get('add', []) + data.get('update', [])
+        all_item_ids = set()
+        all_group_ids = set()
+        for obj_data in all_objects:
+            if int(obj_data.get('type', -1)) == ObjectType.GROUP:
+                all_group_ids.add(obj_data.get('id', 0))
+            else:
+                all_item_ids.add(obj_data.get('id', 0))
 
-        doc.StartUndo()
-        try:
-            root = self._get_or_create_root(doc, filename)
-            inbox = self._get_or_create_inbox(doc, filename)
-            self._prepare(doc, filename)
-
+        with self._undo_step(doc):
+            inbox = self._prepare(doc, filename)
             outbox_ids = self._get_outbox_plasticity_ids(doc, filename)
+            outbox_items, outbox_groups = outbox_ids[0], outbox_ids[1]
 
-            all_item_ids  = set()
-            all_group_ids = set()
-            all_objects   = data.get('add', []) + data.get('update', [])
-
-            for obj_data in all_objects:
-                ot  = int(obj_data.get('type', -1))
-                oid = obj_data.get('id', 0)
-                if ot == ObjectType.GROUP:
-                    all_group_ids.add(oid)
-                else:
-                    all_item_ids.add(oid)
-
-            deferred_ngons = self._process_objects(
+            deferred_ngons, auto_ids = self._process_objects(
                 doc, filename, inbox, all_objects, outbox_ids)
 
             # Delete stale items (but not outbox items)
             stale = [k for k in self._items
                      if k[0] == filename
                      and k[1] not in all_item_ids
-                     and k[1] not in outbox_ids]
+                     and k[1] not in outbox_items]
             for k in stale:
                 obj = self._items.pop(k, None)
                 if obj and obj.GetDocument() == doc:
-                    doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, obj)
+                    self._add_undo(doc, c4d.UNDOTYPE_DELETEOBJ, obj)
                     obj.Remove()
 
             # Delete stale groups (but not outbox groups)
             stale = [k for k in self._groups
                      if k[0] == filename
                      and k[1] not in all_group_ids
-                     and k[1] not in outbox_ids]
+                     and k[1] not in outbox_groups]
             for k in stale:
                 grp = self._groups.pop(k, None)
                 if grp and grp.GetDocument() == doc:
-                    doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, grp)
+                    self._add_undo(doc, c4d.UNDOTYPE_DELETEOBJ, grp)
                     grp.Remove()
 
-        finally:
-            doc.EndUndo()
+            self._process_deferred_ngons(deferred_ngons)
 
-        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
+        self.bridge.status_message = f"Refreshed {filename}"
 
-        # v2.1.0: fire list-complete callback (triggers PutSome if supported)
-        if self.client and self.client.on_list_complete:
-            callback = self.client.on_list_complete
+        # Request Auto-Refacet first, so nothing below can leave tagged
+        # objects waiting for a refacet that was never requested.
+        self._auto_refacet_tagged(doc, filename, auto_ids)
+
+        # Fire the list-complete callback (uploads the Outbox if supported)
+        callback = self.client.on_list_complete if self.client else None
+        if callback is not None:
             self.client.on_list_complete = None
-            callback(filename)
-
-        # Auto-refacet objects that carry the refacet tag
-        self._auto_refacet_tagged(doc, filename, all_item_ids)
+            try:
+                callback(filename)
+            except Exception as e:
+                self.bridge.status_message = f"Error: Outbox upload failed: {e}"
+                print(f"[Plasticity] Outbox upload failed: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _on_transaction(self, event: BridgeEvent):
         """Incremental live-link update."""
@@ -526,87 +406,78 @@ class SceneHandler:
         if not doc:
             return
 
-        doc.StartUndo()
-        deferred_ngons = []
-        try:
-            root = self._get_or_create_root(doc, filename)
-            inbox = self._get_or_create_inbox(doc, filename)
-            self._prepare(doc, filename)
-
+        all_objects = data.get('add', []) + data.get('update', [])
+        auto_ids = []
+        with self._undo_step(doc):
+            inbox = self._prepare(doc, filename)
             outbox_ids = self._get_outbox_plasticity_ids(doc, filename)
 
             for oid in data.get('delete', []):
-                if oid not in outbox_ids:
+                if oid not in outbox_ids[0]:
                     self._delete_item(doc, filename, oid)
 
-            all_objects = data.get('add', []) + data.get('update', [])
+            deferred_ngons = []
             if all_objects:
-                deferred_ngons = self._process_objects(
+                deferred_ngons, auto_ids = self._process_objects(
                     doc, filename, inbox, all_objects, outbox_ids)
+            self._process_deferred_ngons(deferred_ngons)
 
-        finally:
-            doc.EndUndo()
-
-        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
-
-        # Auto-refacet objects that carry the refacet tag
-        if all_objects:
-            updated_ids = set()
-            for obj_data in all_objects:
-                ot  = int(obj_data.get('type', -1))
-                oid = obj_data.get('id', 0)
-                if ot in (ObjectType.SOLID, ObjectType.SHEET):
-                    updated_ids.add(oid)
-            self._auto_refacet_tagged(doc, filename, updated_ids)
+        self._auto_refacet_tagged(doc, filename, auto_ids)
 
     def _on_refacet_response(self, event: BridgeEvent):
         """Re-tessellate objects with new facet settings."""
         data = event.data
         if not data:
             return
-        filename = data.get('filename', '')
         doc = c4d.documents.GetActiveDocument()
+        if data.get('error'):
+            self.bridge.status_message = (
+                f"Error: Refacet failed (Plasticity returned {data['error']})")
+            if doc and self._pending_auto_refacet:
+                # Auto-Refacet requests may have failed: never leave tagged
+                # objects stale — apply the geometry kept aside for them.
+                self._apply_pending_auto_refacet(
+                    doc, list(self._pending_auto_refacet))
+            return
+        filename = data.get('filename', '')
         if not doc:
             return
 
-        deferred_ngons = []
-
-        doc.StartUndo()
-        try:
+        with self._undo_step(doc):
             self._prepare(doc, filename)
+            deferred_ngons = []
 
             for item in data.get('refaceted_objects', []):
                 pid  = item.get('plasticity_id')
                 key  = (filename, pid)
+                stashed = self._pending_auto_refacet.pop(key, None)
                 obj  = self._items.get(key)
                 if not obj or obj.GetDocument() != doc:
                     continue
 
-                verts    = item.get('vertices', [])
-                indices  = item.get('indices',  [])
-                faces    = item.get('faces',    [])
-                normals  = item.get('normals',  [])
-                groups   = item.get('groups',   [])
-                face_ids = item.get('face_ids', [])
-
-                if not verts:
+                result = None
+                if len(item.get('vertices', [])):
+                    result = self._replace_geometry(
+                        doc, obj, item.get('vertices', []),
+                        item.get('indices', []), item.get('faces', []),
+                        item.get('normals', []), item.get('groups', []))
+                if result is None:
+                    # Unusable refacet data: fall back to the update that
+                    # was kept aside for an Auto-Refacet object.
+                    if stashed is not None:
+                        self._apply_stashed(doc, filename, pid, obj, stashed)
                     continue
-
-                doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-                pg, cn, pfv, pfm = self._update_object_geometry(
-                    obj, verts, indices, faces, normals, groups)
+                pg, cn, pfv, pfm = result
                 self._copy_plasticity_meta(
-                    obj, pid, filename, groups, face_ids,
+                    obj, pid, filename, item.get('groups', []),
+                    item.get('face_ids', []),
                     poly_face_map=pfm if not pg else None)
-
                 if pg:
                     deferred_ngons.append((obj, pg, cn, pfv))
 
-        finally:
-            doc.EndUndo()
+            self._process_deferred_ngons(deferred_ngons)
 
-        self._process_deferred_ngons(deferred_ngons)
         c4d.EventAdd()
 
     def _on_new_version(self, event: BridgeEvent):
@@ -627,7 +498,7 @@ class SceneHandler:
                 self.bridge.filename = fn
 
     # =========================================================================
-    # v2.1.0: Handshake & PutSome handlers
+    # Handshake & PutSome handlers
     # =========================================================================
 
     def _on_handshake(self, event: BridgeEvent):
@@ -636,9 +507,9 @@ class SceneHandler:
             return
         supported = data.get('supported_messages', set())
         if self.client:
-            self.client.supported_messages = supported
+            self.client.supported_messages = set(supported)
         self.bridge.status_message = f"Handshake OK — server supports {len(supported)} message types"
-        print(f"[Plasticity] Handshake complete: {supported}")
+        print(f"[Plasticity] Handshake complete: {sorted(supported)}")
 
     def _on_put_some(self, event: BridgeEvent):
         """Handle PUT_SOME_1 response — stamp outbox objects with Plasticity IDs."""
@@ -648,7 +519,7 @@ class SceneHandler:
 
         code = data.get('code', 0)
         if code != 200:
-            self.bridge.status_message = f"PutSome failed with code: {code}"
+            self.bridge.status_message = f"Error: Upload failed (Plasticity returned {code})"
             print(f"[Plasticity] PutSome failed with code: {code}")
             return
 
@@ -659,85 +530,98 @@ class SceneHandler:
         group_results = data.get('group_results', [])
         item_results  = data.get('item_results', [])
 
-        doc.StartUndo()
-        try:
-            # Stamp items with Plasticity IDs
+        # One walk instead of one full-scene walk per result.
+        index = self._index_by_bc_strings(
+            doc, (BC_PLASTICITY_PNS_ID, BC_PLASTICITY_COLLECTION_ID))
+
+        with self._undo_step(doc):
             for item in item_results:
-                c4d_id    = item["c4d_id"]
-                stable_id = item["stable_id"]
-                version_id = item["version_id"]
-
-                obj = self._find_object_by_bc_string(
-                    doc, BC_PLASTICITY_PNS_ID, c4d_id)
+                obj = index.get((BC_PLASTICITY_PNS_ID, item["c4d_id"]))
                 if obj:
-                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+                    self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, obj)
                     bc = obj.GetDataInstance()
-                    bc.SetInt32(BC_PLASTICITY_ID, stable_id)
-                    bc.SetInt32(BC_PLASTICITY_VERSION, version_id)
+                    bc.SetInt32(BC_PLASTICITY_ID, item["stable_id"])
+                    bc.SetInt32(BC_PLASTICITY_VERSION, item["version_id"])
 
-            # Stamp groups with Plasticity IDs
             for group in group_results:
-                collection_id = group["c4d_collection_id"]
-                group_id      = group["group_id"]
-
-                obj = self._find_object_by_bc_string(
-                    doc, BC_PLASTICITY_COLLECTION_ID, collection_id)
+                obj = index.get((BC_PLASTICITY_COLLECTION_ID,
+                                 group["c4d_collection_id"]))
                 if obj:
-                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-                    bc = obj.GetDataInstance()
-                    bc.SetInt32(BC_PLASTICITY_GROUP_ID, group_id)
-        finally:
-            doc.EndUndo()
+                    self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, obj)
+                    obj.GetDataInstance().SetInt32(
+                        BC_PLASTICITY_GROUP_ID, group["group_id"])
 
         self.bridge.status_message = (
-            f"PutSome OK: {len(group_results)} groups, {len(item_results)} items")
+            f"Upload OK: {len(group_results)} groups, {len(item_results)} items")
         print(f"[Plasticity] PutSome succeeded: "
               f"{len(group_results)} groups, {len(item_results)} items")
 
-        # Remember all uploaded IDs so they are filtered on subsequent refreshes
+        # Remember all uploaded IDs so they are filtered on subsequent
+        # refreshes of the same Plasticity file.
+        fn = self._upload_filename
+        if fn is None:
+            fn = self.bridge.filename or ""
+        item_ids, group_ids = self._uploaded_for(fn)
         for item in item_results:
             sid = item.get("stable_id", 0)
             if sid:
-                self._uploaded_ids.add(sid)
+                item_ids.add(sid)
         for group in group_results:
             gid = group.get("group_id", 0)
             if gid:
-                self._uploaded_ids.add(gid)
+                group_ids.add(gid)
         c4d.EventAdd()
 
     @staticmethod
-    def _find_object_by_bc_string(doc, bc_key, value):
-        """Walk the entire document tree to find an object with a matching BC string."""
-        def _search(obj):
+    def _index_by_bc_strings(doc, keys):
+        """{(bc_key, value): object} for every object carrying one of the
+        given string keys (first occurrence wins), in one tree walk."""
+        index = {}
+        stack = [doc.GetFirstObject()]
+        while stack:
+            obj = stack.pop()
             while obj:
                 bc = obj.GetDataInstance()
-                if bc.GetString(bc_key, "") == value:
-                    return obj
-                found = _search(obj.GetDown())
-                if found:
-                    return found
-                obj = obj.GetNext()
-            return None
-        return _search(doc.GetFirstObject())
+                for key in keys:
+                    v = bc.GetString(key, "")
+                    if v and (key, v) not in index:
+                        index[(key, v)] = obj
+                down = obj.GetDown()
+                if down:
+                    stack.append(obj.GetNext())
+                    obj = down
+                else:
+                    obj = obj.GetNext()
+        return index
 
     # =========================================================================
     # Auto-refacet: trigger refacet for tagged objects after geometry updates
     # =========================================================================
 
+    def _auto_refacet_eligible(self, obj):
+        """True if ``obj`` carries an Auto-Refacet tag and a refacet can be
+        requested right now (so its tri update may be skipped)."""
+        return bool(self.client and self.client.connected
+                    and obj.GetTag(REFACET_TAG_ID))
+
     def _auto_refacet_tagged(self, doc, filename, updated_item_ids):
         """Send refacet requests for updated objects that carry the auto-refacet tag.
 
         Called from _on_list_response and _on_transaction — NEVER from
-        _on_refacet_response (to avoid infinite loops).
+        _on_refacet_response (to avoid infinite loops).  Objects whose request
+        cannot be sent get the tri geometry that was kept aside for them.
         """
-        if not self.client or not self.client.connected:
-            return
         if not updated_item_ids:
+            return
+        if not self.client or not self.client.connected:
+            self._apply_pending_auto_refacet(
+                doc, [(filename, i) for i in updated_item_ids])
             return
 
         # Group objects by identical refacet settings so we can batch them
         # into as few server requests as possible.
         settings_groups = {}  # settings_key → (kwargs, [plasticity_ids])
+        failed = []
 
         for obj_id in updated_item_ids:
             key = (filename, obj_id)
@@ -747,6 +631,7 @@ class SceneHandler:
 
             tag = obj.GetTag(REFACET_TAG_ID)
             if not tag:
+                failed.append(key)
                 continue
 
             try:
@@ -754,51 +639,84 @@ class SceneHandler:
             except Exception as e:
                 print(f"[Plasticity] Error reading refacet tag on "
                       f"'{obj.GetName()}': {e}")
+                failed.append(key)
                 continue
 
-            # Build a hashable key from the settings dict
             settings_key = tuple(sorted(kwargs.items()))
-
             if settings_key not in settings_groups:
                 settings_groups[settings_key] = (kwargs, [])
             settings_groups[settings_key][1].append(obj_id)
 
-        # Send one refacet_some per unique settings group
         for kwargs, obj_ids in settings_groups.values():
-            self.client.refacet_some(
+            sent = self.client.refacet_some(
                 filename=filename, plasticity_ids=obj_ids, **kwargs)
+            if sent is None:
+                failed.extend((filename, i) for i in obj_ids)
+
+        if failed:
+            self._apply_pending_auto_refacet(doc, failed)
+
+    def _apply_pending_auto_refacet(self, doc, keys):
+        """Apply the tri geometry kept aside for Auto-Refacet objects."""
+        pending = [(k, self._pending_auto_refacet.pop(k, None)) for k in keys]
+        pending = [(k, item) for k, item in pending if item is not None]
+        if not pending:
+            return
+        with self._undo_step(doc):
+            prepared = set()
+            for (filename, obj_id), item in pending:
+                if filename not in prepared:
+                    self._prepare(doc, filename)
+                    prepared.add(filename)
+                obj = self._items.get((filename, obj_id))
+                if obj and obj.GetDocument() == doc:
+                    self._apply_stashed(doc, filename, obj_id, obj, item)
+        c4d.EventAdd()
+
+    def _apply_stashed(self, doc, filename, obj_id, obj, item):
+        """Apply a kept-aside tri update (list/transaction item)."""
+        result = self._replace_geometry(
+            doc, obj, item.get('vertices', []), item.get('faces', []),
+            [], item.get('normals', []), item.get('groups', []))
+        if result is not None:
+            self._copy_plasticity_meta(
+                obj, obj_id, filename, item.get('groups', []),
+                item.get('face_ids', []), poly_face_map=result[3])
 
     # =========================================================================
     # Cache management
     # =========================================================================
 
     def _prepare(self, doc, filename):
-        """Rebuild caches by scanning the inbox — undo-safe."""
+        """Rebuild caches by scanning the inbox — undo-safe.  Returns the
+        Inbox null (creating root/Inbox/Outbox as needed)."""
         root = self._get_or_create_root(doc, filename)
-        inbox = self._get_or_create_inbox(doc, filename)
-        self._get_or_create_outbox(doc, filename)  # ensure it exists
+        inbox = self._get_or_create_inbox(doc, filename, root)
+        self._get_or_create_outbox(doc, filename, root)  # ensure it exists
 
         self._items  = {k: v for k, v in self._items.items()  if k[0] != filename}
         self._groups = {k: v for k, v in self._groups.items() if k[0] != filename}
 
-        def scan(parent):
-            child = parent.GetDown()
+        stack = [inbox.GetDown()]
+        while stack:
+            child = stack.pop()
             while child:
                 bc  = child.GetDataInstance()
                 pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
-                fn  = bc.GetString(BC_PLASTICITY_FILENAME, "")
-                if pid != 0 and fn == filename:
+                if pid != 0 and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename:
                     if child.CheckType(c4d.Onull):
-                        self._groups[(fn, pid)] = child
+                        self._groups[(filename, pid)] = child
                     else:
-                        self._items[(fn, pid)] = child
-                scan(child)
-                child = child.GetNext()
-
-        scan(inbox)
+                        self._items[(filename, pid)] = child
+                down = child.GetDown()
+                if down:
+                    stack.append(child.GetNext())
+                    child = down
+                else:
+                    child = child.GetNext()
 
         # Migration: also scan root directly for legacy scenes where objects
-        # live directly under root (pre-v2.1.0 hierarchy).  Objects found
+        # live directly under root (pre-1.1.0 hierarchy).  Objects found
         # here will be re-parented into inbox on the next full refresh.
         child = root.GetDown()
         while child:
@@ -816,37 +734,52 @@ class SceneHandler:
                         if (fn, pid) not in self._items:
                             self._items[(fn, pid)] = child
             child = child.GetNext()
+        return inbox
 
     # =========================================================================
-    # v2.1.0: Outbox protection
+    # Outbox protection
     # =========================================================================
 
     def _get_outbox_plasticity_ids(self, doc, filename):
-        """Gather all Plasticity IDs associated with outbox objects.
+        """Plasticity IDs owned by the Outbox: ``(item_ids, group_ids,
+        uploaded_item_ids)``.
 
-        Includes:
-          - BC_PLASTICITY_ID on outbox items (stable_id from PUT_SOME)
-          - BC_PLASTICITY_GROUP_ID on outbox nulls (group_id from PUT_SOME)
-          - All IDs accumulated from prior PUT_SOME responses this session
+        Only IDs the plugin itself stamped after an upload count — the
+        ``BC_PLASTICITY_ID`` of Subdivision Surfaces carrying a
+        ``BC_PLASTICITY_PNS_ID`` and the ``BC_PLASTICITY_GROUP_ID`` of nulls
+        carrying a ``BC_PLASTICITY_COLLECTION_ID`` — plus the IDs returned by
+        PUT_SOME this session for this file.  Cages under an SDS are not
+        searched: a copy of an Inbox mesh used as a cage still carries that
+        mesh's ID and must not hide (or delete) the original.  Items and
+        groups have overlapping ID spaces, so they are kept apart.
+
+        ``uploaded_item_ids`` (this session's PUT_SOME results) are the only
+        IDs whose Inbox copies are deleted as mirrors of an upload.
         """
         outbox = self._get_or_create_outbox(doc, filename)
-        ids = set(self._uploaded_ids)
+        uploaded_items, uploaded_groups = self._uploaded_for(filename)
+        item_ids = set(uploaded_items)
+        group_ids = set(uploaded_groups)
 
-        def gather(parent):
-            child = parent.GetDown()
+        stack = [outbox.GetDown()]
+        while stack:
+            child = stack.pop()
             while child:
                 bc = child.GetDataInstance()
-                pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
-                if pid != 0:
-                    ids.add(pid)
-                gid = bc.GetInt32(BC_PLASTICITY_GROUP_ID, 0)
-                if gid != 0:
-                    ids.add(gid)
-                gather(child)
+                if child.CheckType(c4d.Onull):
+                    gid = bc.GetInt32(BC_PLASTICITY_GROUP_ID, 0)
+                    if gid and bc.GetString(BC_PLASTICITY_COLLECTION_ID, ""):
+                        group_ids.add(gid)
+                    if child.GetDown():
+                        stack.append(child.GetNext())
+                        child = child.GetDown()
+                        continue
+                elif child.CheckType(c4d.Osds):
+                    pid = bc.GetInt32(BC_PLASTICITY_ID, 0)
+                    if pid and bc.GetString(BC_PLASTICITY_PNS_ID, ""):
+                        item_ids.add(pid)
                 child = child.GetNext()
-
-        gather(outbox)
-        return ids
+        return item_ids, group_ids, set(uploaded_items)
 
     # =========================================================================
     # Hierarchy / visibility preservation helpers
@@ -867,12 +800,16 @@ class SceneHandler:
         bc = parent.GetDataInstance()
         if bc.GetBool(BC_PLASTICITY_INBOX):
             return True
+        # The root null itself: objects directly under it are the pre-1.1.0
+        # layout and must be migrated into the Inbox (1.1.6 skipped them).
+        if (bc.GetBool(BC_PLASTICITY_ROOT)
+                and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename):
+            return True
         return (parent.CheckType(c4d.Onull)
                 and bc.GetInt32(BC_PLASTICITY_ID, 0) != 0
                 and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename)
 
-    @staticmethod
-    def _apply_visibility(obj, flags, vis):
+    def _apply_visibility(self, doc, obj, flags, vis):
         """Push editor/render visibility only when the Plasticity-side flags
         actually changed since the last refresh.  This lets the user
         hide/show objects in C4D without every refresh reverting it, while
@@ -880,6 +817,7 @@ class SceneHandler:
         """
         bc = obj.GetDataInstance()
         if bc.GetInt32(BC_PLASTICITY_FLAGS, -1) != flags:
+            self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, obj)
             obj[c4d.ID_BASEOBJECT_VISIBILITY_EDITOR] = vis
             obj[c4d.ID_BASEOBJECT_VISIBILITY_RENDER] = vis
             bc.SetInt32(BC_PLASTICITY_FLAGS, flags)
@@ -893,13 +831,21 @@ class SceneHandler:
         Pass 1: Geometry — create new objects or update existing in-place.
         Pass 2: Hierarchy — re-parent, apply visibility.
 
-        N-gon melts are deferred until after all insertions in Pass 1.
-        Objects whose ID is in outbox_ids are skipped entirely.
+        ``outbox_ids`` is ``(item_ids, group_ids)``; those objects are owned
+        by the Outbox and skipped (an Inbox mirror of an uploaded item is
+        removed).  Existing objects that carry an Auto-Refacet tag keep
+        their geometry: the update is kept aside and their IDs are returned
+        so a single refacet response rebuilds them.
+
+        Returns ``(deferred_ngons, auto_refacet_ids)``; N-gon melts are
+        deferred until after all insertions in Pass 1.
         """
-        if outbox_ids is None:
-            outbox_ids = set()
+        outbox_ids = tuple(outbox_ids or (set(), set()))
+        outbox_items, outbox_groups = outbox_ids[0], outbox_ids[1]
+        upload_mirrors = outbox_ids[2] if len(outbox_ids) > 2 else set()
 
         deferred_ngons = []
+        auto_refacet_ids = []
 
         # ── Pass 1: Geometry ──────────────────────────────────────────────────
         for item in objects:
@@ -907,41 +853,58 @@ class SceneHandler:
             obj_id   = item.get('id', 0)
             name     = item.get('name', f"Object_{obj_id}")
 
-            if obj_id in outbox_ids:
-                continue
-
-            verts    = item.get('vertices', [])
-            indices  = item.get('faces',    [])
-            normals  = item.get('normals',  [])
-            groups   = item.get('groups',   [])
-            face_ids = item.get('face_ids', [])
-
             if obj_type == ObjectType.GROUP:
-                if obj_id == 0:
+                if obj_id == 0 or obj_id in outbox_groups:
                     continue
                 key = (filename, obj_id)
-                if key not in self._groups:
+                grp = self._groups.get(key)
+                if grp is None:
                     grp = c4d.BaseObject(c4d.Onull)
                     grp.SetName(name)
                     self._copy_plasticity_meta(grp, obj_id, filename)
                     self._insert_last_child(doc, grp, inbox)
-                    doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, grp)
+                    self._add_undo(doc, c4d.UNDOTYPE_NEWOBJ, grp)
                     self._groups[key] = grp
-                else:
-                    self._groups[key].SetName(name)
+                elif grp.GetName() != name:
+                    self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, grp)
+                    grp.SetName(name)
 
             elif obj_type in (ObjectType.SOLID, ObjectType.SHEET):
-                if not verts:
+                key = (filename, obj_id)
+                if obj_id in outbox_items:
+                    if obj_id in upload_mirrors:
+                        # An Inbox copy of an object uploaded this session
+                        # (a Live Link update that arrived before the
+                        # PUT_SOME response) is redundant — remove it.
+                        self._delete_item(doc, filename, obj_id)
                     continue
 
-                key      = (filename, obj_id)
+                verts    = item.get('vertices', [])
+                indices  = item.get('faces',    [])
+                normals  = item.get('normals',  [])
+                groups   = item.get('groups',   [])
+                face_ids = item.get('face_ids', [])
+
+                if not len(verts):
+                    continue
+
                 existing = self._items.get(key)
 
                 if existing and existing.GetDocument() == doc:
-                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, existing)
-                    existing.SetName(name)
-                    pg, cn, pfv, pfm = self._update_object_geometry(
-                        existing, verts, indices, [], normals, groups)
+                    if self._auto_refacet_eligible(existing):
+                        self._pending_auto_refacet[key] = item
+                        auto_refacet_ids.append(obj_id)
+                        if existing.GetName() != name:
+                            self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL,
+                                           existing)
+                            existing.SetName(name)
+                        continue
+                    result = self._replace_geometry(
+                        doc, existing, verts, indices, [], normals, groups,
+                        name=name)
+                    if result is None:
+                        continue
+                    pg, cn, pfv, pfm = result
                     self._copy_plasticity_meta(
                         existing, obj_id, filename, groups, face_ids,
                         poly_face_map=pfm if not pg else None)
@@ -949,36 +912,38 @@ class SceneHandler:
                         deferred_ngons.append((existing, pg, cn, pfv))
 
                 else:
-                    points, polys, normal_map, poly_groups, cn, pfv = \
-                        self._compute_geometry(verts, indices, [], normals, groups)
-
-                    if not polys:
+                    built = self._compute_geometry(verts, indices, [],
+                                                   normals, groups)
+                    if not built.polys:
                         continue
 
-                    new_obj = c4d.PolygonObject(len(points), len(polys))
+                    new_obj = c4d.PolygonObject(len(built.points),
+                                                len(built.polys))
                     new_obj.SetName(name)
-                    self._write_points_and_polys(new_obj, points, polys)
+                    self._write_points_and_polys(new_obj, built.points,
+                                                 built.polys)
 
-                    if not poly_groups and normals and normal_map:
-                        self._apply_normals(new_obj, normals, normal_map)
-                        pfm = self._compute_tri_face_map(len(polys), groups)
-                    else:
-                        pfm = None
+                    if not built.poly_groups and built.normal_data:
+                        self._write_normal_tag(new_obj, built.normal_data)
 
                     phong = new_obj.MakeTag(c4d.Tphong)
-                    phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
-                    phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
+                    phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(
+                        _PHONG_ANGLE_DEG)
+                    phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(built.poly_groups)
                     new_obj.Message(c4d.MSG_UPDATE)
 
                     self._copy_plasticity_meta(
                         new_obj, obj_id, filename, groups, face_ids,
-                        poly_face_map=pfm)
+                        poly_face_map=(built.face_map
+                                       if not built.poly_groups else None))
                     self._insert_last_child(doc, new_obj, inbox)
-                    doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, new_obj)
+                    self._add_undo(doc, c4d.UNDOTYPE_NEWOBJ, new_obj)
                     self._items[key] = new_obj
 
-                    if poly_groups:
-                        deferred_ngons.append((new_obj, poly_groups, cn, pfv))
+                    if built.poly_groups:
+                        deferred_ngons.append(
+                            (new_obj, built.poly_groups, built.corner_normals,
+                             built.poly_face_val))
 
         # ── Pass 2: Re-parent and apply visibility ────────────────────────────
         for item in objects:
@@ -987,220 +952,81 @@ class SceneHandler:
             parent_id = item.get('parent_id', 0)
             flags     = item.get('flags', 6)
 
-            if obj_id == 0 or obj_id in outbox_ids:
+            if obj_id == 0:
                 continue
 
             should_hide = bool(flags & 1) or not bool(flags & 2)
             vis = c4d.OBJECT_OFF if should_hide else c4d.OBJECT_UNDEF
 
             if obj_type == ObjectType.GROUP:
-                key = (filename, obj_id)
-                grp = self._groups.get(key)
-                if not grp:
+                if obj_id in outbox_groups:
                     continue
-                target_parent = inbox
-                if parent_id > 0 and (filename, parent_id) in self._groups:
-                    target_parent = self._groups[(filename, parent_id)]
-                if grp.GetUp() != target_parent:
-                    if self._is_managed_parent(grp.GetUp(), filename, inbox):
-                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, grp)
-                        grp.Remove()
-                        self._insert_last_child(doc, grp, target_parent)
-                self._apply_visibility(grp, flags, vis)
-
+                target = self._groups.get((filename, obj_id))
             elif obj_type in (ObjectType.SOLID, ObjectType.SHEET):
-                key = (filename, obj_id)
-                obj = self._items.get(key)
-                if not obj:
+                if obj_id in outbox_items:
                     continue
-                target_parent = inbox
-                if parent_id > 0 and (filename, parent_id) in self._groups:
-                    target_parent = self._groups[(filename, parent_id)]
-                if obj.GetUp() != target_parent:
-                    if self._is_managed_parent(obj.GetUp(), filename, inbox):
-                        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-                        obj.Remove()
-                        self._insert_last_child(doc, obj, target_parent)
-                self._apply_visibility(obj, flags, vis)
+                target = self._items.get((filename, obj_id))
+            else:
+                continue
+            if not target:
+                continue
 
-        return deferred_ngons
+            target_parent = inbox
+            if parent_id > 0 and (filename, parent_id) in self._groups:
+                target_parent = self._groups[(filename, parent_id)]
+            if target.GetUp() != target_parent:
+                if self._is_managed_parent(target.GetUp(), filename, inbox):
+                    self._add_undo(doc, c4d.UNDOTYPE_CHANGE, target)
+                    target.Remove()
+                    self._insert_last_child(doc, target, target_parent)
+            self._apply_visibility(doc, target, flags, vis)
+
+        return deferred_ngons, auto_refacet_ids
 
     # =========================================================================
     # Geometry computation
     # =========================================================================
 
+    class _Built:
+        __slots__ = ("points", "polys", "poly_groups", "corner_normals",
+                     "poly_face_val", "face_map", "normal_data", "dropped")
+
     def _compute_geometry(self, vertices, indices, faces, normals, groups):
-        """Route to the correct geometry builder."""
-        if faces:
-            return self._compute_ngon_geometry(vertices, indices, faces, normals, groups)
+        """Build C4D-ready geometry.  ``faces`` (refacet data) selects the
+        N-gon path, otherwise the data is plain triangles."""
+        b = SceneHandler._Built()
+        if len(faces):
+            m = geo.build_ngon_mesh(vertices, indices, faces, normals, groups)
+            b.points = [c4d.Vector(x, y, z) for x, y, z in m.points]
+            b.polys = [c4d.CPolygon(a, bb, c, d) for a, bb, c, d in m.polys]
+            b.poly_groups = m.poly_groups
+            b.corner_normals = m.corner_normals
+            b.poly_face_val = m.poly_face_val
+            # Without N-gons to melt, each polygon's group is known exactly
+            # (1.1.x used tri arithmetic here, wrong for quads — F13).
+            b.face_map = m.poly_face_val
+            corners = m.corners
+            b.dropped = m.dropped
         else:
-            return self._compute_tri_geometry(vertices, indices, normals, groups)
-
-    def _compute_tri_geometry(self, vertices, indices, normals, groups):
-        """Build pure-triangle geometry for standard ADD/UPDATE objects."""
-        vert_count = len(vertices) // 3
-        tri_count  = len(indices)  // 3
-
-        points = []
-        s = _IMPORT_SCALE
-        for i in range(vert_count):
-            points.append(c4d.Vector(
-                vertices[i * 3]     * s,
-                vertices[i * 3 + 2] * s,
-                vertices[i * 3 + 1] * s,
-            ))
-
-        polys      = []
-        normal_map = []
-        for i in range(tri_count):
-            a  = indices[i * 3]
-            b  = indices[i * 3 + 1]
-            c_ = indices[i * 3 + 2]
-            polys.append(c4d.CPolygon(a, c_, b))
-            normal_map.append((a, c_, b, b))
-
-        return points, polys, normal_map, [], {}, []
-
-    def _compute_ngon_geometry(self, vertices, indices, faces, normals, groups):
-        """Build geometry for N-gon refacet data."""
-        vert_count = len(vertices) // 3
-
-        group_starts = []
-        for gi in range(len(groups) // 2):
-            group_starts.append((groups[gi * 2], gi))
-        group_starts.sort(key=lambda x: x[0])
-        gs_keys = [gs[0] for gs in group_starts]
-
-        def _face_val_to_group_idx(loop_pos):
-            idx = bisect.bisect_right(gs_keys, loop_pos) - 1
-            if idx >= 0:
-                return group_starts[idx][1]
-            return 0
-
-        vert_map   = {}
-        old_to_new = [0] * vert_count
-        unique_pts = []
-        s = _IMPORT_SCALE
-
-        for i in range(vert_count):
-            px = vertices[i * 3]
-            py = vertices[i * 3 + 1]
-            pz = vertices[i * 3 + 2]
-            key = (round(px, 7), round(py, 7), round(pz, 7))
-            if key not in vert_map:
-                vert_map[key] = len(unique_pts)
-                unique_pts.append(c4d.Vector(px * s, pz * s, py * s))
-            old_to_new[i] = vert_map[key]
-
-        new_indices = [old_to_new[idx] for idx in indices]
-
-        polys         = []
-        normal_map    = []
-        poly_groups   = []
-        poly_face_val = []
-        poly_idx      = 0
-
-        corner_normals = {}
-        has_normals    = len(normals) >= 3
-
-        def _ntuple(orig_vi):
-            base = orig_vi * 3
-            if base + 2 < len(normals):
-                return (
-                    normals[base],
-                    normals[base + 2],
-                    normals[base + 1],
-                )
-            return (0.0, 1.0, 0.0)
-
-        poly_starts = [0]
-        for i in range(1, len(faces)):
-            if faces[i] != faces[i - 1]:
-                poly_starts.append(i)
-        poly_starts.append(len(faces))
-
-        for p in range(len(poly_starts) - 1):
-            start = poly_starts[p]
-            end   = poly_starts[p + 1]
-
-            raw_face_vi = new_indices[start:end]
-            raw_orig_vi = indices[start:end]
-            group_idx = _face_val_to_group_idx(start)
-
-            if has_normals:
-                for k in range(len(raw_face_vi)):
-                    welded_vi = raw_face_vi[k]
-                    cn_key = (welded_vi, group_idx)
-                    if cn_key not in corner_normals:
-                        corner_normals[cn_key] = _ntuple(raw_orig_vi[k])
-
-            face_vindices = []
-            orig_vindices = []
-            for k in range(len(raw_face_vi)):
-                if k == 0 or raw_face_vi[k] != raw_face_vi[k - 1]:
-                    face_vindices.append(raw_face_vi[k])
-                    orig_vindices.append(raw_orig_vi[k])
-            if len(face_vindices) > 1 and face_vindices[-1] == face_vindices[0]:
-                face_vindices.pop()
-                orig_vindices.pop()
-
-            count = len(face_vindices)
-            if count < 3:
-                continue
-
-            group_poly_indices = []
-
-            if count == 3:
-                ia, ib, ic = face_vindices
-                polys.append(c4d.CPolygon(ia, ic, ib))
-                normal_map.append((
-                    orig_vindices[0], orig_vindices[2],
-                    orig_vindices[1], orig_vindices[1],
-                ))
-                group_poly_indices.append(poly_idx)
-                poly_face_val.append(group_idx)
-                poly_idx += 1
-
-            elif count == 4:
-                ia, ib, ic, id_ = face_vindices
-                polys.append(c4d.CPolygon(ia, id_, ic, ib))
-                normal_map.append((
-                    orig_vindices[0], orig_vindices[3],
-                    orig_vindices[2], orig_vindices[1],
-                ))
-                group_poly_indices.append(poly_idx)
-                poly_face_val.append(group_idx)
-                poly_idx += 1
-
-            else:
-                face_pts_3d = [unique_pts[vi] for vi in face_vindices]
-                face_normal = _compute_polygon_normal(face_pts_3d)
-                pts_2d = _project_to_2d(face_pts_3d, face_normal)
-                ear_tris = _ear_clip(pts_2d)
-
-                if not ear_tris:
-                    print(f"[Plasticity] Ear-clip failed for {count}-gon, "
-                          f"falling back to fan triangulation")
-                    ear_tris = [(0, t + 1, t + 2) for t in range(count - 2)]
-
-                for li_a, li_b, li_c in ear_tris:
-                    ia = face_vindices[li_a]
-                    ib = face_vindices[li_b]
-                    ic = face_vindices[li_c]
-
-                    polys.append(c4d.CPolygon(ia, ic, ib))
-                    normal_map.append((
-                        orig_vindices[li_a], orig_vindices[li_c],
-                        orig_vindices[li_b], orig_vindices[li_b],
-                    ))
-                    group_poly_indices.append(poly_idx)
-                    poly_face_val.append(group_idx)
-                    poly_idx += 1
-
-            if len(group_poly_indices) > 1:
-                poly_groups.append(group_poly_indices)
-
-        return unique_pts, polys, normal_map, poly_groups, corner_normals, poly_face_val
+            m = geo.build_tri_mesh(vertices, indices, make_point=c4d.Vector,
+                                   make_poly=c4d.CPolygon)
+            b.points = m.points
+            b.polys = m.polys
+            b.poly_groups = []
+            b.corner_normals = {}
+            b.poly_face_val = []
+            b.face_map = geo.tri_face_map(len(b.polys), groups)
+            corners = m
+            b.dropped = m.dropped
+        if b.dropped:
+            print(f"[Plasticity] Skipped {b.dropped} invalid polygon(s) "
+                  f"(missing vertices or fewer than 3 corners)")
+        b.normal_data = None
+        if len(normals) >= 3 and not b.poly_groups:
+            if isinstance(corners, geo.TriMesh):
+                corners = corners.corners
+            b.normal_data = geo.pack_vertex_normals(normals, corners)
+        return b
 
     # =========================================================================
     # Write geometry
@@ -1208,39 +1034,65 @@ class SceneHandler:
 
     @staticmethod
     def _write_points_and_polys(obj, points, polys):
-        for i, pt   in enumerate(points): obj.SetPoint(i, pt)
-        for i, poly in enumerate(polys):  obj.SetPolygon(i, poly)
+        """Bulk point write (``SetAllPoints``) and one SetPolygon per polygon
+        — the Python API has no bulk polygon setter."""
+        obj.SetAllPoints(points)
+        set_polygon = obj.SetPolygon
+        for i, poly in enumerate(polys):
+            set_polygon(i, poly)
+
+    @staticmethod
+    def _resize(obj, point_count, poly_count):
+        """ResizeObject and clear stale N-gon data.
+
+        1.1.6 passes ``ncnt=0`` to drop the old N-gon structure (fixes N-gon
+        collapse on repeated refacet).  The Python docs only document
+        ``ResizeObject(pcnt[, vcnt])``, so fall back if a build rejects the
+        third argument.
+        """
+        try:
+            return obj.ResizeObject(point_count, poly_count, 0)
+        except TypeError:
+            return obj.ResizeObject(point_count, poly_count)
 
     # =========================================================================
     # In-place geometry update
     # =========================================================================
 
-    def _update_object_geometry(self, obj, vertices, indices, faces, normals,
-                                groups):
-        """Replace all geometry on an existing PolygonObject in-place."""
-        points, polys, normal_map, poly_groups, corner_normals, poly_face_val = \
-            self._compute_geometry(vertices, indices, faces, normals, groups)
-        if not polys:
-            return [], {}, [], None
+    def _replace_geometry(self, doc, obj, vertices, indices, faces, normals,
+                          groups, name=None):
+        """Replace all geometry on an existing PolygonObject in-place.
 
+        Returns ``(poly_groups, corner_normals, poly_face_val, poly_face_map)``
+        or ``None`` when the data has no usable polygons — then the object,
+        including its metadata, is left untouched.
+        """
+        built = self._compute_geometry(vertices, indices, faces, normals,
+                                       groups)
+        if not built.polys:
+            return None
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE, obj)
+        if name is not None:
+            obj.SetName(name)
         self._strip_managed_tags(obj)
-        obj.ResizeObject(len(points), len(polys), 0)
-        self._write_points_and_polys(obj, points, polys)
+        self._resize(obj, len(built.points), len(built.polys))
+        self._write_points_and_polys(obj, built.points, built.polys)
 
         poly_face_map = None
-        if not poly_groups:
-            if normals and normal_map:
-                self._apply_normals(obj, normals, normal_map)
-            poly_face_map = self._compute_tri_face_map(len(polys), groups)
+        if not built.poly_groups:
+            if built.normal_data:
+                self._write_normal_tag(obj, built.normal_data)
+            poly_face_map = built.face_map
 
         phong = obj.GetTag(c4d.Tphong)
         if not phong:
             phong = obj.MakeTag(c4d.Tphong)
-            phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(40)
-        phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(poly_groups)
+            phong[c4d.PHONGTAG_PHONG_ANGLE] = c4d.utils.DegToRad(_PHONG_ANGLE_DEG)
+        phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = bool(built.poly_groups)
 
         obj.Message(c4d.MSG_UPDATE)
-        return poly_groups, corner_normals, poly_face_val, poly_face_map
+        return (built.poly_groups, built.corner_normals, built.poly_face_val,
+                poly_face_map)
 
     def _strip_managed_tags(self, obj):
         tag = obj.GetFirstTag()
@@ -1260,65 +1112,19 @@ class SceneHandler:
     # Custom normals
     # =========================================================================
 
-    def _apply_normals(self, obj, normals, normal_map):
-        """Write per-corner normals (tri mode)."""
-        poly_count   = obj.GetPolygonCount()
-        normal_count = len(normals) // 3
-        if poly_count == 0 or normal_count == 0:
-            return
-
-        tag = c4d.NormalTag(poly_count)
-        tag.SetName(MANAGED_NORMAL_TAG_NAME)
-        obj.InsertTag(tag)
-
-        def _nvec(v_id):
-            if v_id * 3 + 2 < len(normals):
-                return c4d.Vector(
-                    normals[v_id * 3],
-                    normals[v_id * 3 + 2],
-                    normals[v_id * 3 + 1],
-                )
-            return c4d.Vector(0.0, 1.0, 0.0)
-
-        try:
-            data_w = tag.GetDataAddressW()
-            for i in range(poly_count):
-                ids = normal_map[i] if i < len(normal_map) else (0, 0, 0, 0)
-                c4d.NormalTag.SetPolygon(data_w, i,
-                                         {c: _nvec(v) for c, v in zip('abcd', ids)})
-            return
-        except (AttributeError, TypeError):
-            pass
-
-        data = array.array('h')
-        def pack_n(v):
-            return int(max(-32767.0, min(32767.0, v * 32767.0)))
-
-        for i in range(poly_count):
-            ids = normal_map[i] if i < len(normal_map) else (0, 0, 0, 0)
-            for v_id in ids:
-                if v_id * 3 + 2 < len(normals):
-                    data.extend([
-                        pack_n(normals[v_id * 3]),
-                        pack_n(normals[v_id * 3 + 2]),
-                        pack_n(normals[v_id * 3 + 1]),
-                    ])
-                else:
-                    data.extend([0, 0, 0])
-
-        buf = tag.GetLowlevelDataAddressW()
-        if buf:
-            raw = data.tobytes()
-            buf[:len(raw)] = raw
-
     @staticmethod
-    def _apply_normals_from_corner_map(obj, corner_normals, post_melt_face_map):
-        """Write per-corner normals AFTER N-gon melt."""
-        poly_count = obj.GetPolygonCount()
-        if poly_count == 0 or not corner_normals:
-            return
+    def _write_normal_tag(obj, raw):
+        """Insert a managed NormalTag holding ``raw`` (12 int16 per polygon).
 
-        fallback_t = (0.0, 1.0, 0.0)
+        Fast path: copy into the tag's low-level buffer
+        (``VariableTag.GetLowlevelDataAddressW``).  Fallback: the R26+
+        high-level ``NormalTag.Set(data, i, {'a'..'d': Vector})``.
+        (1.1.x called a non-existent ``NormalTag.SetPolygon`` first, so only
+        its low-level path ever ran.)
+        """
+        poly_count = obj.GetPolygonCount()
+        if poly_count == 0 or not raw:
+            return None
 
         tag = obj.GetFirstTag()
         while tag:
@@ -1331,71 +1137,31 @@ class SceneHandler:
         tag.SetName(MANAGED_NORMAL_TAG_NAME)
         obj.InsertTag(tag)
 
-        def _get_normal(vert_idx, group_idx):
-            t = corner_normals.get((vert_idx, group_idx), fallback_t)
-            return c4d.Vector(t[0], t[1], t[2])
+        try:
+            if _write_lowlevel(tag.GetLowlevelDataAddressW(), raw):
+                return tag
+        except (AttributeError, TypeError, ValueError) as e:
+            print(f"[Plasticity] Low-level normal write failed ({e}); "
+                  f"using NormalTag.Set")
 
         try:
             data_w = tag.GetDataAddressW()
-            for i in range(poly_count):
-                gi = post_melt_face_map[i] if i < len(post_melt_face_map) else 0
-                cp = obj.GetPolygon(i)
-                is_tri = (cp.c == cp.d)
-                c4d.NormalTag.SetPolygon(data_w, i, {
-                    'a': _get_normal(cp.a, gi),
-                    'b': _get_normal(cp.b, gi),
-                    'c': _get_normal(cp.c, gi),
-                    'd': _get_normal(cp.d, gi) if not is_tri
-                         else _get_normal(cp.c, gi),
-                })
-            return
-        except (AttributeError, TypeError):
-            pass
-
-        data = array.array('h')
-        def pack_n(v):
-            return int(max(-32767.0, min(32767.0, v * 32767.0)))
-
-        for i in range(poly_count):
-            gi = post_melt_face_map[i] if i < len(post_melt_face_map) else 0
-            cp = obj.GetPolygon(i)
-            is_tri = (cp.c == cp.d)
-            for vert_idx in (cp.a, cp.b, cp.c,
-                             cp.d if not is_tri else cp.c):
-                t = corner_normals.get((vert_idx, gi), fallback_t)
-                data.extend([pack_n(t[0]), pack_n(t[1]), pack_n(t[2])])
-
-        buf = tag.GetLowlevelDataAddressW()
-        if buf:
-            raw = data.tobytes()
-            buf[:len(raw)] = raw
-
-    # =========================================================================
-    # Poly-face map helpers
-    # =========================================================================
+            for i, (na, nb, nc, nd) in enumerate(geo.unpack_normals(raw)):
+                c4d.NormalTag.Set(data_w, i, {
+                    'a': c4d.Vector(*na), 'b': c4d.Vector(*nb),
+                    'c': c4d.Vector(*nc), 'd': c4d.Vector(*nd)})
+        except Exception as e:
+            print(f"[Plasticity] Could not write normals: {e}")
+        return tag
 
     @staticmethod
-    def _compute_tri_face_map(poly_count, groups):
-        """Build the poly_face_map for tri-mode geometry."""
-        if not groups or poly_count == 0:
-            return [0] * poly_count
-
-        n_groups = len(groups) // 2
-        boundaries = sorted(
-            ((groups[gi * 2], gi) for gi in range(n_groups)),
-            key=lambda x: x[0],
-        )
-        b_keys = [b[0] for b in boundaries]
-
-        result = []
-        for pi in range(poly_count):
-            loop_pos = pi * 3
-            idx = bisect.bisect_right(b_keys, loop_pos) - 1
-            if idx >= 0:
-                result.append(boundaries[idx][1])
-            else:
-                result.append(0)
-        return result
+    def _apply_normals_from_corner_map(obj, corner_normals, post_melt_face_map):
+        """Write per-corner normals AFTER N-gon melt."""
+        if obj.GetPolygonCount() == 0 or not corner_normals:
+            return
+        raw = geo.pack_corner_normals(_poly_tuples(obj), post_melt_face_map,
+                                      corner_normals)
+        SceneHandler._write_normal_tag(obj, raw)
 
     # =========================================================================
     # N-gon creation — MCOMMAND_MELT with polygon-identity hashing
@@ -1419,141 +1185,71 @@ class SceneHandler:
 
         doc = obj.GetDocument()
 
-        all_polys = obj.GetAllPolygons()
-        polygon_identity = {
-            i: (cp.a, cp.b, cp.c, cp.d)
-            for i, cp in enumerate(all_polys)
-        }
-
+        pre_polys = _poly_tuples(obj)
         identity_to_group = {}
-        for orig_pid, id_key in polygon_identity.items():
+        for orig_pid, id_key in enumerate(pre_polys):
             if orig_pid < len(poly_face_val):
                 identity_to_group[id_key] = poly_face_val[orig_pid]
 
-        group_edges = []
-        for group in groups_to_melt:
-            edges = set()
-            for pid in group:
-                identity = polygon_identity.get(pid)
-                if identity is None:
+        batches = geo.melt_batches(groups_to_melt, pre_polys)
+
+        # MELT works on (and replaces) the polygon selection: keep the
+        # user's selection and put it back afterwards.
+        sel = obj.GetPolygonS()
+        saved = [i for i, s in enumerate(sel.GetAll(len(pre_polys))) if s]
+
+        try:
+            for batch in batches:
+                if not batch:
                     continue
-                a, b, c, d = identity
-                if c == d:
-                    verts = (a, b, c)
-                else:
-                    verts = (a, b, c, d)
-                n = len(verts)
-                for i in range(n):
-                    v1, v2 = verts[i], verts[(i + 1) % n]
-                    edges.add((v1, v2) if v1 < v2 else (v2, v1))
-            group_edges.append(edges)
 
-        n_groups = len(groups_to_melt)
-        adjacent = [set() for _ in range(n_groups)]
+                inverted = {
+                    (cp.a, cp.b, cp.c, cp.d): i
+                    for i, cp in enumerate(obj.GetAllPolygons())
+                }
 
-        edge_to_group = {}
-        for gi, edges in enumerate(group_edges):
-            for edge in edges:
-                prev_gi = edge_to_group.get(edge)
-                if prev_gi is not None and prev_gi != gi:
-                    adjacent[gi].add(prev_gi)
-                    adjacent[prev_gi].add(gi)
-                else:
-                    edge_to_group[edge] = gi
+                real_indices = []
+                for gi in batch:
+                    for orig_pid in groups_to_melt[gi]:
+                        if 0 <= orig_pid < len(pre_polys):
+                            idx = inverted.get(pre_polys[orig_pid])
+                            if idx is not None:
+                                real_indices.append(idx)
 
-        colors = [-1] * n_groups
-        batches = []
+                if len(real_indices) < 2:
+                    continue
 
-        for gi in range(n_groups):
-            used = set()
-            for adj_gi in adjacent[gi]:
-                if colors[adj_gi] >= 0:
-                    used.add(colors[adj_gi])
+                sel.DeselectAll()
+                for pid in real_indices:
+                    sel.Select(pid)
 
-            color = 0
-            while color in used:
-                color += 1
-
-            colors[gi] = color
-            while len(batches) <= color:
-                batches.append([])
-            batches[color].append(gi)
-
-        for batch in batches:
-            if not batch:
-                continue
-
-            inverted = {
-                (cp.a, cp.b, cp.c, cp.d): i
-                for i, cp in enumerate(obj.GetAllPolygons())
-            }
-
-            real_indices = []
-            for gi in batch:
-                for orig_pid in groups_to_melt[gi]:
-                    id_key = polygon_identity.get(orig_pid)
-                    if id_key is not None and id_key in inverted:
-                        real_indices.append(inverted[id_key])
-
-            if len(real_indices) < 2:
-                continue
-
-            sel = obj.GetPolygonS()
+                result = c4d.utils.SendModelingCommand(
+                    command=c4d.MCOMMAND_MELT,
+                    list=[obj],
+                    mode=c4d.MODELINGCOMMANDMODE_POLYGONSELECTION,
+                    bc=c4d.BaseContainer(),
+                    doc=doc,
+                )
+                if not result:
+                    print(f"[Plasticity] Warning: MCOMMAND_MELT failed for "
+                          f"batch of {len(batch)} groups")
+        finally:
             sel.DeselectAll()
-            for pid in real_indices:
-                sel.Select(pid)
+            count = obj.GetPolygonCount()
+            for i in saved:
+                if i < count:
+                    sel.Select(i)
 
-            result = c4d.utils.SendModelingCommand(
-                command=c4d.MCOMMAND_MELT,
-                list=[obj],
-                mode=c4d.MODELINGCOMMANDMODE_POLYGONSELECTION,
-                bc=c4d.BaseContainer(),
-                doc=doc,
-            )
-            if not result:
-                grp_count = len(batch)
-                print(f"[Plasticity] Warning: MCOMMAND_MELT failed for "
-                      f"batch of {grp_count} groups")
-
-        post_polys = obj.GetAllPolygons()
-        post_melt_face_map = []
-
-        vert_groups = {}
-        for (vi, gi) in corner_normals:
-            if vi not in vert_groups:
-                vert_groups[vi] = set()
-            vert_groups[vi].add(gi)
-
-        for cp in post_polys:
-            id_key = (cp.a, cp.b, cp.c, cp.d)
-
-            gi = identity_to_group.get(id_key)
-            if gi is not None:
-                post_melt_face_map.append(gi)
-                continue
-
-            is_tri = (cp.c == cp.d)
-            corner_verts = [cp.a, cp.b, cp.c]
-            if not is_tri:
-                corner_verts.append(cp.d)
-
-            common = vert_groups.get(corner_verts[0], set()).copy()
-            for cv in corner_verts[1:]:
-                common &= vert_groups.get(cv, set())
-                if len(common) <= 1:
-                    break
-
-            if len(common) == 1:
-                post_melt_face_map.append(next(iter(common)))
-            elif len(common) > 1:
-                best_gi = next(iter(common))
-                post_melt_face_map.append(best_gi)
-            else:
-                post_melt_face_map.append(0)
+        post_polys = _poly_tuples(obj)
+        vert_groups = (geo.vertex_groups_from_corner_normals(corner_normals)
+                       if corner_normals
+                       else geo.vertex_groups(pre_polys, poly_face_val))
+        post_melt_face_map = geo.post_melt_face_map(
+            post_polys, identity_to_group, vert_groups)
 
         if corner_normals:
-            self._apply_normals_from_corner_map(
-                obj, corner_normals, post_melt_face_map)
+            self._write_normal_tag(obj, geo.pack_corner_normals(
+                post_polys, post_melt_face_map, corner_normals))
             phong = obj.GetTag(c4d.Tphong)
             if phong:
                 phong[c4d.PHONGTAG_PHONG_ANGLELIMIT] = False
@@ -1572,17 +1268,18 @@ class SceneHandler:
         bc.SetInt32(BC_PLASTICITY_ID, int(plasticity_id))
         bc.SetString(BC_PLASTICITY_FILENAME, str(filename))
         if groups   is not None:
-            bc.SetString(BC_PLASTICITY_GROUPS,   json.dumps(groups))
+            bc.SetString(BC_PLASTICITY_GROUPS,   json.dumps(list(groups)))
         if face_ids is not None:
-            bc.SetString(BC_PLASTICITY_FACE_IDS, json.dumps(face_ids))
+            bc.SetString(BC_PLASTICITY_FACE_IDS, json.dumps(list(face_ids)))
         if poly_face_map is not None:
             bc.SetString(BC_PLASTICITY_POLY_FACE_MAP,
-                         json.dumps(poly_face_map))
+                         geo.encode_poly_face_map(poly_face_map))
 
     @staticmethod
     def _store_poly_face_map(obj, poly_face_map):
         bc = obj.GetDataInstance()
-        bc.SetString(BC_PLASTICITY_POLY_FACE_MAP, json.dumps(poly_face_map))
+        bc.SetString(BC_PLASTICITY_POLY_FACE_MAP,
+                     geo.encode_poly_face_map(poly_face_map))
 
     # =========================================================================
     # Scene-tree helpers
@@ -1590,125 +1287,117 @@ class SceneHandler:
 
     def _get_or_create_root(self, doc, filename):
         """Get or create the root Null for a Plasticity filename."""
-        if filename in self._roots:
-            r = self._roots[filename]
-            if r.GetDocument() == doc:
+        root = self._roots.get(filename)
+        if root is None or root.GetDocument() != doc:
+            root = self._find_root_recursive(doc.GetFirstObject(), doc, filename)
+            if root is None:
+                display_name = f"Plasticity: {filename}" if filename else "Plasticity"
+                root = c4d.BaseObject(c4d.Onull)
+                root.SetName(display_name)
+                rbc = root.GetDataInstance()
+                rbc.SetBool(BC_PLASTICITY_ROOT, True)
+                rbc.SetString(BC_PLASTICITY_FILENAME, filename)
                 s = self.unit_scale
-                r[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
-                return r
-
-        found = self._find_root_recursive(doc.GetFirstObject(), doc, filename)
-        if found:
-            self._roots[filename] = found
-            s = self.unit_scale
-            found[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
-            return found
-
-        display_name = f"Plasticity: {filename}" if filename else "Plasticity"
-        root = c4d.BaseObject(c4d.Onull)
-        root.SetName(display_name)
-        s = self.unit_scale
-        root[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
-        rbc = root.GetDataInstance()
-        rbc.SetBool(BC_PLASTICITY_ROOT, True)
-        rbc.SetString(BC_PLASTICITY_FILENAME, filename)
-        doc.InsertObject(root)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, root)
-        self._roots[filename] = root
-
-        # v2.1.0: create Outbox (first) and Inbox (second) under new root
-        self._create_inbox_outbox(doc, root)
-
+                root[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
+                doc.InsertObject(root)
+                self._add_undo(doc, c4d.UNDOTYPE_NEWOBJ, root)
+                # Outbox (first) and Inbox (second) under the new root
+                self._create_outbox(doc, root)
+                self._create_inbox(doc, root)
+            self._roots[filename] = root
+        self._apply_root_scale(doc, root)
         return root
 
-    def _create_inbox_outbox(self, doc, root):
-        """Create Outbox and Inbox nulls under root (order: Outbox first, Inbox second)."""
+    def _apply_root_scale(self, doc, root):
+        s = self.unit_scale
+        target = c4d.Vector(s, s, s)
+        if root[c4d.ID_BASEOBJECT_SCALE] != target:
+            self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, root)
+            root[c4d.ID_BASEOBJECT_SCALE] = target
+
+    def _create_outbox(self, doc, root):
         outbox = c4d.BaseObject(c4d.Onull)
         outbox.SetName("Outbox")
         outbox.GetDataInstance().SetBool(BC_PLASTICITY_OUTBOX, True)
-        self._insert_last_child(doc, outbox, root)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, outbox)
+        doc.InsertObject(outbox, parent=root)          # first child
+        self._add_undo(doc, c4d.UNDOTYPE_NEWOBJ, outbox)
+        return outbox
 
+    def _create_inbox(self, doc, root):
         inbox = c4d.BaseObject(c4d.Onull)
         inbox.SetName("Inbox")
         inbox.GetDataInstance().SetBool(BC_PLASTICITY_INBOX, True)
         self._insert_last_child(doc, inbox, root)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, inbox)
-
-    def _get_or_create_inbox(self, doc, filename):
-        """Find or create the Inbox null under the root for this filename."""
-        root = self._get_or_create_root(doc, filename)
-        child = root.GetDown()
-        while child:
-            if child.GetDataInstance().GetBool(BC_PLASTICITY_INBOX):
-                return child
-            child = child.GetNext()
-
-        # Inbox not found — create both inbox and outbox
-        # (handles migration from pre-v2.1.0 scenes)
-        self._create_inbox_outbox(doc, root)
-        child = root.GetDown()
-        while child:
-            if child.GetDataInstance().GetBool(BC_PLASTICITY_INBOX):
-                return child
-            child = child.GetNext()
-
-        # Should not reach here, but be safe
-        inbox = c4d.BaseObject(c4d.Onull)
-        inbox.SetName("Inbox")
-        inbox.GetDataInstance().SetBool(BC_PLASTICITY_INBOX, True)
-        self._insert_last_child(doc, inbox, root)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, inbox)
+        self._add_undo(doc, c4d.UNDOTYPE_NEWOBJ, inbox)
         return inbox
 
-    def _get_or_create_outbox(self, doc, filename):
+    @staticmethod
+    def _find_flagged_child(root, flag):
+        child = root.GetDown()
+        while child:
+            if child.GetDataInstance().GetBool(flag):
+                return child
+            child = child.GetNext()
+        return None
+
+    def _get_or_create_inbox(self, doc, filename, root=None):
+        """Find or create the Inbox null under the root for this filename.
+
+        Only the missing null is created (1.1.x recreated both, leaving a
+        duplicate Inbox when the user had deleted the Outbox)."""
+        if root is None:
+            root = self._get_or_create_root(doc, filename)
+        return (self._find_flagged_child(root, BC_PLASTICITY_INBOX)
+                or self._create_inbox(doc, root))
+
+    def _get_or_create_outbox(self, doc, filename, root=None):
         """Find or create the Outbox null under the root for this filename."""
-        root = self._get_or_create_root(doc, filename)
-        child = root.GetDown()
-        while child:
-            if child.GetDataInstance().GetBool(BC_PLASTICITY_OUTBOX):
-                return child
-            child = child.GetNext()
-
-        # Outbox not found — create both
-        self._create_inbox_outbox(doc, root)
-        child = root.GetDown()
-        while child:
-            if child.GetDataInstance().GetBool(BC_PLASTICITY_OUTBOX):
-                return child
-            child = child.GetNext()
-
-        outbox = c4d.BaseObject(c4d.Onull)
-        outbox.SetName("Outbox")
-        outbox.GetDataInstance().SetBool(BC_PLASTICITY_OUTBOX, True)
-        doc.InsertObject(outbox, parent=root)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, outbox)
-        return outbox
+        if root is None:
+            root = self._get_or_create_root(doc, filename)
+        return (self._find_flagged_child(root, BC_PLASTICITY_OUTBOX)
+                or self._create_outbox(doc, root))
 
     def _find_root_recursive(self, obj, doc, filename):
         """Walk the full scene hierarchy to find a root null matching filename."""
-        while obj:
-            bc = obj.GetDataInstance()
-            if (obj.CheckType(c4d.Onull)
-                    and bc.GetBool(BC_PLASTICITY_ROOT)
-                    and bc.GetString(BC_PLASTICITY_FILENAME, "") == filename):
-                return obj
-            found = self._find_root_recursive(obj.GetDown(), doc, filename)
-            if found:
-                return found
-            obj = obj.GetNext()
+        for root in self._iter_roots(obj):
+            if root.GetDataInstance().GetString(BC_PLASTICITY_FILENAME, "") == filename:
+                return root
         return None
+
+    @staticmethod
+    def _iter_roots(obj):
+        """All Plasticity root nulls in the tree starting at ``obj``."""
+        stack = [obj]
+        while stack:
+            o = stack.pop()
+            while o:
+                if (o.CheckType(c4d.Onull)
+                        and o.GetDataInstance().GetBool(BC_PLASTICITY_ROOT)):
+                    yield o
+                down = o.GetDown()
+                if down:
+                    stack.append(o.GetNext())
+                    o = down
+                else:
+                    o = o.GetNext()
 
     def _delete_item(self, doc, filename, obj_id):
         key = (filename, obj_id)
         obj = self._items.pop(key, None)
+        self._pending_auto_refacet.pop(key, None)
         if obj and obj.GetDocument() == doc:
-            doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, obj)
+            self._add_undo(doc, c4d.UNDOTYPE_DELETEOBJ, obj)
             obj.Remove()
 
     @staticmethod
     def _insert_last_child(doc, obj, parent):
-        """Append obj as last child of parent."""
+        """Append obj as last child of parent (C++-side, instead of walking
+        all siblings in Python for every insertion)."""
+        try:
+            obj.InsertUnderLast(parent)
+            return
+        except AttributeError:
+            pass
         last  = None
         child = parent.GetDown()
         while child:
@@ -1720,27 +1409,21 @@ class SceneHandler:
             doc.InsertObject(obj, parent=parent)
 
     # =========================================================================
-    # v2.1.0: Outbox data gathering for PutSome
+    # Outbox data gathering for PutSome
     # =========================================================================
 
     def get_outbox_data(self, filename, only_visible=False):
         """Walk the Outbox and gather SDS mesh data for PUT_SOME_1.
 
-        In Cinema 4D a Subdivision Surface (c4d.Osds) is a generator object.
-        Its children form the control cage — which can be a single polygon
-        object, parametric primitives (Cube, Sphere, Torus …), or any nesting
-        of generators (Symmetry, Connect, Boole, Array …).
+        In Cinema 4D a Subdivision Surface (c4d.Osds) is a generator that
+        subdivides its FIRST child object, including that child's whole
+        hierarchy (C4D help, "Subdivision Surface").  That child — a polygon
+        object, a parametric primitive, any generator (Symmetry, Boole,
+        Loft, Sweep, Cloner …) or a null holding several of them — is the
+        control cage that is uploaded as a SubD.
 
-        Only SDS objects are eligible for upload; plain polygon objects placed
-        directly in the Outbox are skipped with a warning.
-
-        The control cage is resolved via a two-tier approach:
-          Fast path  — single Opolygon child → use directly (zero overhead).
-          Generator  — anything else → clone children, evaluate with
-                       MCOMMAND_CURRENTSTATETOOBJECT in a temp document,
-                       JOIN if multiple polygon results.
-
-        Null objects (c4d.Onull) in the outbox are treated as groups.
+        Nulls in the Outbox become groups.  Every other object type placed
+        directly in the Outbox is skipped with a warning.
 
         Returns {"groups": [...], "items": [...]}.
         """
@@ -1748,33 +1431,39 @@ class SceneHandler:
         if not doc:
             return {"groups": [], "items": []}
 
-        outbox = self._get_or_create_outbox(doc, filename)
-
         groups = []
         items  = []
+        skipped = []
+        seen_coll = set()
+        seen_pns = set()
+        self._upload_filename = filename
 
-        def gather(parent, parent_collection_id=""):
-            child = parent.GetDown()
-            while child:
-                if only_visible and not child.GetEditorMode() == c4d.MODE_ON:
-                    # Skip hidden objects — but only when truly hidden, not
-                    # when in default mode.  C4D's GetEditorMode returns
-                    # MODE_UNDEF (use parent), MODE_ON (visible),
-                    # MODE_OFF (hidden).
-                    if child.GetEditorMode() == c4d.MODE_OFF:
+        with self._undo_step(doc):
+            outbox = self._get_or_create_outbox(doc, filename)
+            root = outbox.GetUp()
+            root_inv = ~root.GetMg() if root is not None else c4d.Matrix()
+
+            def gather(parent, parent_collection_id=""):
+                child = parent.GetDown()
+                while child:
+                    if only_visible and not self._is_visible(doc, child):
                         child = child.GetNext()
                         continue
 
-                bc = child.GetDataInstance()
+                    bc = child.GetDataInstance()
 
-                if child.CheckType(c4d.Onull):
-                    # Null → treat as group/collection
-                    coll_id = bc.GetString(BC_PLASTICITY_COLLECTION_ID, "")
-                    if not coll_id:
-                        coll_id = uuid.uuid4().hex
-                        bc.SetString(BC_PLASTICITY_COLLECTION_ID, coll_id)
+                    if child.CheckType(c4d.Onull):
+                        coll_id = bc.GetString(BC_PLASTICITY_COLLECTION_ID, "")
+                        if not coll_id or coll_id in seen_coll:
+                            # New null, or a copy of an uploaded one: give it
+                            # its own identity.
+                            self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, child)
+                            if coll_id:
+                                bc.SetInt32(BC_PLASTICITY_GROUP_ID, 0)
+                            coll_id = uuid.uuid4().hex
+                            bc.SetString(BC_PLASTICITY_COLLECTION_ID, coll_id)
+                        seen_coll.add(coll_id)
 
-                    if child != outbox:
                         groups.append({
                             "c4d_collection_id": coll_id,
                             "name": child.GetName(),
@@ -1782,401 +1471,234 @@ class SceneHandler:
                             "existing_group_id": bc.GetInt32(
                                 BC_PLASTICITY_GROUP_ID, 0),
                         })
+                        gather(child, coll_id)
 
-                    current_parent_id = coll_id
-                    gather(child, current_parent_id)
+                    elif child.CheckType(c4d.Osds):
+                        item_data = self._extract_sds_item(
+                            child, parent_collection_id, root_inv, seen_pns)
+                        if item_data:
+                            items.append(item_data)
+                        else:
+                            skipped.append(child.GetName())
 
-                elif child.CheckType(c4d.Osds):
-                    # Subdivision Surface → resolve control cage
-                    poly_obj, is_temp = self._resolve_control_cage(child)
-                    if not poly_obj:
-                        print(f"[Plasticity] Warning: SDS '{child.GetName()}' "
-                              f"could not be resolved to a polygon mesh "
-                              f"— skipping")
-                        child = child.GetNext()
-                        continue
+                    else:
+                        skipped.append(child.GetName())
+                        print(f"[Plasticity] Warning: '{child.GetName()}' in the "
+                              f"Outbox is not a Subdivision Surface or a Null "
+                              f"— skipped.  Put it under a Subdivision Surface "
+                              f"to upload it.")
 
-                    item_data = self._extract_sds_item(
-                        child, poly_obj, parent_collection_id, is_temp)
-                    if item_data:
-                        items.append(item_data)
+                    child = child.GetNext()
 
-                elif child.CheckType(c4d.Opolygon):
-                    print(f"[Plasticity] Warning: Object '{child.GetName()}' "
-                          f"is not under a Subdivision Surface — skipping. "
-                          f"Only SDS objects can be uploaded to Plasticity.")
+            gather(outbox)
 
-                child = child.GetNext()
-
-        gather(outbox)
+        if skipped:
+            self.bridge.status_message = (
+                f"Warning: {len(skipped)} Outbox object(s) skipped — "
+                f"see the Console")
         return {"groups": groups, "items": items}
 
+    def _is_visible(self, doc, obj):
+        """Effective editor visibility: the nearest explicit ON/OFF dot up the
+        hierarchy wins, undefined defers to the parent (GetEditorMode docs);
+        a layer with "view" disabled also hides the object."""
+        modes = []
+        o = obj
+        while o is not None:
+            modes.append(o.GetEditorMode())
+            o = o.GetUp()
+        if not geo.effective_editor_visibility(modes, c4d.MODE_ON, c4d.MODE_OFF):
+            return False
+        try:
+            layer_data = obj.GetLayerData(doc)
+            if layer_data and not layer_data.get("view", True):
+                return False
+        except (AttributeError, TypeError):
+            pass
+        return True
+
     # =========================================================================
-    # Control-cage resolution (fast path + CSTO generator path)
+    # Control-cage resolution
     # =========================================================================
 
     def _resolve_control_cage(self, sds_obj):
-        """Resolve an SDS's children into a single PolygonObject.
+        """Resolve an SDS's control cage into polygon sources.
 
-        Fast path:
-            If the SDS has exactly one direct child and that child is already
-            an Opolygon, return it directly.  Zero overhead.
+        Returns ``(sources, keepalive)``: ``sources`` is a list of
+        ``(PolygonObject, matrix)`` pairs where ``matrix`` maps the
+        polygon's points into the SDS's local space; ``keepalive`` holds the
+        temporary document (if one was needed) and must stay referenced
+        until the points have been read.
 
-        Generator path (two tiers):
-            PRIMARY — read the polygon caches that Cinema 4D has already
-            computed for the real-document objects.  Parametric primitives
-            (Cube, Sphere, Tube …) and generators (Symmetry, Connect, Boole,
-            Array …) all populate their caches as part of normal scene
-            evaluation.  Reading these is instant and requires no temp
-            document.
-
-            FALLBACK — if no caches are found (e.g. freshly created objects
-            whose caches have not been built yet), clone children into a
-            temporary BaseDocument, force-build caches with ExecutePasses,
-            then run MCOMMAND_CURRENTSTATETOOBJECT.
-
-            If either tier produces multiple polygon objects they are joined
-            with MCOMMAND_JOIN.
-
-        Returns:
-            (poly_obj, is_temp)
-
-            poly_obj : c4d.PolygonObject — the resolved control cage.
-            is_temp  : bool — True if poly_obj lives in a temporary document
-                       (caller must NOT store persistent references to it).
-
-            Returns (None, False) on failure.
+        Primary: walk the caches Cinema 4D has already built for the first
+        child's hierarchy.  Fallback: clone the child into a temporary
+        document, build its caches with ExecutePasses, and as a last resort
+        run MCOMMAND_CURRENTSTATETOOBJECT (whose result list is used — 1.1.x
+        ignored it).  No MCOMMAND_JOIN: it only joins the children of an
+        object passed to it, so the 1.1.x call never merged anything; parts
+        are merged in Python instead.
         """
         first_child = sds_obj.GetDown()
         if first_child is None:
-            return None, False
+            return [], None
+        if first_child.GetNext() is not None:
+            print(f"[Plasticity] Note: SDS '{sds_obj.GetName()}' has several "
+                  f"children; Cinema 4D only subdivides the first one "
+                  f"('{first_child.GetName()}'), so only it is uploaded.")
 
-        # ── Fast path ────────────────────────────────────────────────────
-        has_sibling = first_child.GetNext() is not None
-        if first_child.CheckType(c4d.Opolygon) and not has_sibling:
-            return first_child, False
+        sources = []
+        self._collect_cage_sources(first_child, c4d.Matrix(), sources)
+        if sources:
+            return sources, None
 
-        # ── Primary: cache-based resolution ──────────────────────────────
-        # C4D has already computed polygon caches for all generators and
-        # parametrics in the real document.  Walk each child and harvest
-        # its resolved polygon data — no temp document required.
-        poly_sources = []
-        child = sds_obj.GetDown()
-        while child:
-            self._collect_polygon_caches(child, poly_sources)
-            child = child.GetNext()
+        # ── Fallback: evaluate a clone in a temporary document ───────────
+        temp_doc = c4d.documents.BaseDocument()
+        clone = first_child.GetClone(c4d.COPYFLAGS_NONE)
+        if clone is None:
+            return [], None
+        temp_doc.InsertObject(clone)       # keeps its SDS-relative Ml
+        temp_doc.ExecutePasses(None, True, True, True, 0)
+        self._collect_cage_sources(clone, c4d.Matrix(), sources)
+        if sources:
+            return sources, temp_doc
 
-        if poly_sources:
-            return self._combine_polygon_sources(poly_sources)
+        result = c4d.utils.SendModelingCommand(
+            command=c4d.MCOMMAND_CURRENTSTATETOOBJECT,
+            list=[clone],
+            mode=c4d.MODELINGCOMMANDMODE_ALL,
+            bc=c4d.BaseContainer(),
+            doc=temp_doc,
+        )
+        if isinstance(result, list):
+            result = result[0] if result else None
+        if isinstance(result, c4d.BaseObject):
+            # CSTO returns a new object carrying the input's matrix.
+            self._collect_cage_sources(result, c4d.Matrix(), sources)
+            return sources, (temp_doc, result)
 
-        # ── Fallback: CSTO in temp document ──────────────────────────────
-        return self._csto_resolve(sds_obj)
+        print(f"[Plasticity] CSTO failed for SDS '{sds_obj.GetName()}'")
+        return [], None
 
-    def _collect_polygon_caches(self, obj, result):
-        """Recursively collect polygon data from an object's cache hierarchy.
+    @staticmethod
+    def _consumes_children(obj):
+        """True for generators that use their children as input (Symmetry,
+        Boole, Loft, Cloner …): their cache already contains the children."""
+        try:
+            return bool(obj.GetInfo() & c4d.OBJECT_INPUT)
+        except (AttributeError, TypeError):
+            return True   # 1.1.x never walked children of cached generators
 
-        Traversal order:
-          1. GetDeformCache() — polygon WITH active deformers (Bend, Twist …).
-          2. Direct Opolygon — polygon with no active deformers.
-          3. GetCache()      — generator or parametric primitive output
-                              (Symmetry, Array, Boole, Cube, Sphere …).
-          4. GetDown()       — cache containers that are plain null/group
-                              hierarchies whose polygon children need walking.
+    def _collect_cage_sources(self, obj, parent_mat, out, depth=0):
+        """Collect polygon objects of ``obj``'s hierarchy with their matrices.
 
-        Checking (1) before (2) is essential: a polygon object that has
-        deformers applied stores the deformed result in GetDeformCache(), not
-        in the object itself.  Returning early on Opolygon before this check
-        would silently discard all deformer effects.
+        Order follows Maxon's cache recursion (BaseObject.GetCache docs):
+          1. deform cache — the host's deformed points, in the host's space
+             (so the host's matrix is used, not the cache's own);
+          2. a polygon object itself;
+          3. a generator's cache — the cache root's matrix is relative to
+             the generator, nested cache objects relative to their parent
+             (GetMg() is not valid on cache objects, so the chain is built
+             explicitly);
+          4. children, unless a generator consumed them as input.
         """
-        # 1. Deform cache — always takes priority over the raw polygon data.
+        if depth > 256:
+            return
+        mat = parent_mat * obj.GetMl()
+
         deform_cache = obj.GetDeformCache()
         if deform_cache is not None:
-            self._collect_polygon_caches(deform_cache, result)
-            sib = deform_cache.GetNext()
-            while sib:
-                self._collect_polygon_caches(sib, result)
-                sib = sib.GetNext()
-            return
+            if (deform_cache.CheckType(c4d.Opolygon)
+                    and deform_cache.GetPolygonCount() > 0):
+                out.append((deform_cache, mat))
+        elif obj.CheckType(c4d.Opolygon):
+            if obj.GetPointCount() > 0 and obj.GetPolygonCount() > 0:
+                out.append((obj, mat))
+        else:
+            cache = obj.GetCache()
+            if cache is not None:
+                node = cache
+                while node:
+                    self._collect_cage_sources(node, mat, out, depth + 1)
+                    node = node.GetNext()
+                if self._consumes_children(obj):
+                    return
 
-        # 2. Already a fully-evaluated polygon with no active deformers.
-        if obj.CheckType(c4d.Opolygon) and obj.GetPointCount() > 0:
-            result.append(obj)
-            return
-
-        # 3. Generator / parametric cache (Symmetry, Boole, Cube, Sphere …).
-        cache = obj.GetCache()
-        if cache is not None:
-            self._collect_polygon_caches(cache, result)
-            sib = cache.GetNext()
-            while sib:
-                self._collect_polygon_caches(sib, result)
-                sib = sib.GetNext()
-            return
-
-        # 4. No cache found on this node — walk its children.
-        # This handles null/group containers returned as cache hierarchies by
-        # some generators (e.g. Boole in certain C4D builds returns a null
-        # whose polygon children hold the actual geometry).
         child = obj.GetDown()
         while child:
-            self._collect_polygon_caches(child, result)
+            self._collect_cage_sources(child, mat, out, depth + 1)
             child = child.GetNext()
 
-    def _combine_polygon_sources(self, poly_sources):
-        """Clone polygon sources and optionally JOIN them into one mesh.
-
-        Returns (poly_obj, is_temp=True) or (None, False) on failure.
-        """
-        # Keep the temp doc alive on self so the returned poly_obj is not
-        # freed by Python's GC before the caller reads it.
-        temp_doc = c4d.documents.BaseDocument()
-        self._temp_cage_doc = temp_doc
-        clones = []
-        for src in poly_sources:
-            clone = src.GetClone(c4d.COPYFLAGS_NONE)
-            if clone and clone.CheckType(c4d.Opolygon) and clone.GetPointCount() > 0:
-                temp_doc.InsertObject(clone)
-                clones.append(clone)
-
-        if not clones:
-            return None, False
-
-        if len(clones) == 1:
-            return clones[0], True
-
-        # Multiple polygon objects → join into a single mesh.
-        join_ok = c4d.utils.SendModelingCommand(
-            command=c4d.MCOMMAND_JOIN,
-            list=clones,
-            mode=c4d.MODELINGCOMMANDMODE_ALL,
-            bc=c4d.BaseContainer(),
-            doc=temp_doc,
-        )
-
-        if join_ok and clones:
-            joined = clones[0]
-            if joined.CheckType(c4d.Opolygon) and joined.GetPointCount() > 0:
-                return joined, True
-
-        # Fallback: return the largest clone by vertex count.
-        clones.sort(key=lambda o: o.GetPointCount(), reverse=True)
-        return clones[0], True
-
-    def _csto_resolve(self, sds_obj):
-        """Fallback: resolve SDS children via CSTO in a temporary document.
-
-        Used when the primary cache-based approach finds no polygon data
-        (e.g. objects whose caches have not been built yet).
-
-        Returns (poly_obj, is_temp=True) or (None, False) on failure.
-        """
-        # Keep the temp doc alive on self so the returned poly_obj is not
-        # freed by Python's GC before the caller reads it.
-        temp_doc = c4d.documents.BaseDocument()
-        self._temp_cage_doc = temp_doc
-
-        # Collect and clone the SDS's direct children (preserving order).
-        children = []
-        child = sds_obj.GetDown()
-        while child:
-            children.append(child)
-            child = child.GetNext()
-
-        if not children:
-            return None, False
-
-        # Build the target for CSTO.
-        # Single child → clone it directly.
-        # Multiple children → wrap clones in a Connect Object so CSTO merges
-        # them into a single mesh (exactly how the real SDS would see them).
-        if len(children) == 1:
-            target = children[0].GetClone(c4d.COPYFLAGS_NONE)
-            temp_doc.InsertObject(target)
-        else:
-            target = c4d.BaseObject(c4d.Oconnector)
-            temp_doc.InsertObject(target)
-            prev_clone = None
-            for orig in children:
-                clone = orig.GetClone(c4d.COPYFLAGS_NONE)
-                if prev_clone is None:
-                    clone.InsertUnder(target)
-                else:
-                    clone.InsertAfter(prev_clone)
-                prev_clone = clone
-
-        # Force cache evaluation — parametric objects and generators only
-        # build their polygon caches when the document executes its passes.
-        # Without this, CSTO has no geometry to convert.
-        temp_doc.ExecutePasses(None, True, True, True, 0)
-
-        # After evaluation, try reading caches directly.  For generators like
-        # Loft, Sweep, Lathe, etc., ExecutePasses populates GetCache() and this
-        # is faster and more reliable than CSTO.  Deformer effects are also
-        # captured via GetDeformCache() through the same traversal.
-        cache_sources = []
-        # Walk every top-level clone in the temp doc.
-        t = temp_doc.GetFirstObject()
-        while t:
-            self._collect_polygon_caches(t, cache_sources)
-            t = t.GetNext()
-
-        if cache_sources:
-            return self._combine_polygon_sources(cache_sources)
-
-        # Run Current State to Object.
-        csto_list = [target]
-        csto_result = c4d.utils.SendModelingCommand(
-            command=c4d.MCOMMAND_CURRENTSTATETOOBJECT,
-            list=csto_list,
-            mode=c4d.MODELINGCOMMANDMODE_ALL,
-            bc=c4d.BaseContainer(),
-            doc=temp_doc,
-        )
-
-        if csto_result is False:
-            print(f"[Plasticity] CSTO failed for SDS '{sds_obj.GetName()}'")
-            return None, False
-
-        # Collect all polygon objects from every possible result location.
-        # Depending on the C4D version, CSTO may:
-        #   (a) return the BaseObject directly as the function result,
-        #   (b) replace the element in the input list, or
-        #   (c) insert the result into the temp document.
-        poly_objects = []
-
-        def _collect_polys(obj):
-            while obj:
-                if (isinstance(obj, c4d.BaseObject)
-                        and obj.CheckType(c4d.Opolygon)
-                        and obj.GetPointCount() > 0):
-                    poly_objects.append(obj)
-                if isinstance(obj, c4d.BaseObject):
-                    _collect_polys(obj.GetDown())
-                    obj = obj.GetNext()
-                else:
-                    break
-
-        # (a) Direct BaseObject return
-        if isinstance(csto_result, c4d.BaseObject):
-            if csto_result.CheckType(c4d.Opolygon) and csto_result.GetPointCount() > 0:
-                poly_objects.append(csto_result)
-            else:
-                _collect_polys(csto_result.GetDown())
-
-        # (b) Modified input list
-        if not poly_objects:
-            for item in csto_list:
-                if not isinstance(item, c4d.BaseObject):
-                    continue
-                if item.CheckType(c4d.Opolygon) and item.GetPointCount() > 0:
-                    poly_objects.append(item)
-                else:
-                    _collect_polys(item.GetDown())
-
-        # (c) Temp document contents
-        if not poly_objects:
-            _collect_polys(temp_doc.GetFirstObject())
-
-        if not poly_objects:
-            print(f"[Plasticity] CSTO produced no polygon data for "
-                  f"SDS '{sds_obj.GetName()}'")
-            return None, False
-
-        if len(poly_objects) == 1:
-            return poly_objects[0], True
-
-        # Multiple polygon results → join into a single mesh.
-        for po in poly_objects:
-            if po.GetDocument() is None:
-                temp_doc.InsertObject(po)
-
-        join_ok = c4d.utils.SendModelingCommand(
-            command=c4d.MCOMMAND_JOIN,
-            list=poly_objects,
-            mode=c4d.MODELINGCOMMANDMODE_ALL,
-            bc=c4d.BaseContainer(),
-            doc=temp_doc,
-        )
-
-        if join_ok and poly_objects:
-            joined = poly_objects[0]
-            if joined.CheckType(c4d.Opolygon) and joined.GetPointCount() > 0:
-                return joined, True
-
-        poly_objects.sort(key=lambda o: o.GetPointCount(), reverse=True)
-        return poly_objects[0], True
+    @staticmethod
+    def _ngon_groups(poly_obj, poly_count):
+        """Polygon index groups, one per visible face (N-gon or polygon)."""
+        try:
+            _count, polymap = poly_obj.GetPolygonTranslationMap()
+        except Exception:
+            polymap = None
+        return geo.groups_from_polymap(polymap, poly_count)
 
     # =========================================================================
     # SDS item extraction
     # =========================================================================
 
-    def _extract_sds_item(self, sds_obj, poly_obj, parent_collection_id,
-                          is_temp=False):
-        """Extract mesh data from a resolved control cage polygon object.
+    def _extract_sds_item(self, sds_obj, parent_collection_id, root_inv=None,
+                          seen_ids=None):
+        """Build the PUT_SOME item for one Subdivision Surface.
 
-        Args:
-            sds_obj              : the Subdivision Surface object (in the real doc)
-            poly_obj             : the resolved polygon control cage
-            parent_collection_id : parent group's collection ID
-            is_temp              : True if poly_obj is a temporary CSTO result
+        Points are baked through the full matrix chain (part → SDS → world)
+        and expressed relative to the Plasticity root null, which inverts
+        the unit scale and any root transform; then scaled back to metres
+        and axis-swapped.  N-gons are exported as single faces.
 
         Returns a dict ready for encode_put_some(), or None on failure.
         """
-        point_count = poly_obj.GetPointCount()
-        poly_count  = poly_obj.GetPolygonCount()
-        if point_count == 0 or poly_count == 0:
+        sources, keepalive = self._resolve_control_cage(sds_obj)
+        if not sources:
+            print(f"[Plasticity] Warning: SDS '{sds_obj.GetName()}' "
+                  f"could not be resolved to a polygon mesh — skipping")
+            return None
+
+        if root_inv is None:
+            root_inv = c4d.Matrix()
+        base = root_inv * sds_obj.GetMg()
+
+        parts = []
+        fragmented = 0
+        for poly_obj, mat in sources:
+            m = base * mat
+            points = [m * p for p in poly_obj.GetAllPoints()]
+            polys = _poly_tuples(poly_obj)
+            faces, frag = geo.faces_from_groups(
+                polys, self._ngon_groups(poly_obj, len(polys)))
+            fragmented += frag
+            parts.append((geo.export_positions(points), faces))
+        del keepalive
+
+        if fragmented:
+            print(f"[Plasticity] Warning: {fragmented} N-gon(s) on "
+                  f"'{sds_obj.GetName()}' have holes or touch themselves and "
+                  f"were exported as their triangle/quad pieces")
+
+        positions, indices, sizes = geo.merge_mesh_parts(parts)
+        if not sizes:
             return None
 
         # Persistent ID — always stored on the SDS so it survives even when
         # the control cage is rebuilt from generators on every export.
+        # A copy of an uploaded SDS carries the original's IDs: give it its
+        # own so both are uploaded as separate objects.
         sds_bc = sds_obj.GetDataInstance()
         pns_id = sds_bc.GetString(BC_PLASTICITY_PNS_ID, "")
-        if not pns_id:
+        if not pns_id or (seen_ids is not None and pns_id in seen_ids):
+            doc = sds_obj.GetDocument()
+            if doc is not None:
+                self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SMALL, sds_obj)
+            if pns_id:
+                sds_bc.SetInt32(BC_PLASTICITY_ID, 0)
             pns_id = uuid.uuid4().hex
             sds_bc.SetString(BC_PLASTICITY_PNS_ID, pns_id)
-
-        # World-space positions with coordinate reverse-transform.
-        # C4D → Plasticity:  Pl X = C4D X,  Pl Y = C4D Z,  Pl Z = C4D Y
-        #
-        # Transform selection:
-        #   Fast path  (is_temp=False):
-        #       poly_obj is a real child of the SDS in the document.
-        #       GetMg() naturally includes the entire parent chain.
-        #
-        #   Generator path  (is_temp=True):
-        #       poly_obj lives in a temp document at the root level.
-        #       Its vertex positions already include all child-local
-        #       transforms (baked by CSTO), but NOT the SDS's world
-        #       transform.  Apply the SDS's world matrix manually.
-        if is_temp:
-            mg = sds_obj.GetMg()
-        else:
-            mg = poly_obj.GetMg()
-
-        scale_inv = 1.0 / (_IMPORT_SCALE * self.unit_scale)
-
-        positions = []
-        for i in range(point_count):
-            local_pt = poly_obj.GetPoint(i)
-            world_pt = mg * local_pt
-            positions.append(world_pt.x * scale_inv)   # Pl X = C4D X
-            positions.append(world_pt.z * scale_inv)   # Pl Y = C4D Z
-            positions.append(world_pt.y * scale_inv)   # Pl Z = C4D Y
-
-        # Polygon extraction — reverse the winding back to Plasticity convention.
-        # Import does CPolygon(a, c, b) for tris and CPolygon(a, d, c, b) for quads.
-        # Export reverses: tri (a,c,b)→(a,b,c), quad (a,d,c,b)→(a,b,c,d).
-        indices = []
-        sizes   = []
-        for i in range(poly_count):
-            cp = poly_obj.GetPolygon(i)
-            is_tri = (cp.c == cp.d)
-            if is_tri:
-                indices.extend([cp.a, cp.c, cp.b])
-                sizes.append(3)
-            else:
-                indices.extend([cp.a, cp.d, cp.c, cp.b])
-                sizes.append(4)
+        if seen_ids is not None:
+            seen_ids.add(pns_id)
 
         # Options bitfield
         options = _KIND_SUBD
@@ -2226,15 +1748,14 @@ class SceneHandler:
     # =========================================================================
 
     def update_unit_scale(self, scale: float):
-        """Update unit scale on all existing root nulls immediately."""
+        """Update unit scale on all Plasticity root nulls in the document."""
         self.unit_scale = max(0.0001, float(scale))
         doc = c4d.documents.GetActiveDocument()
         if not doc:
             return
-        s = self.unit_scale
-        for fn, root in self._roots.items():
-            if root and root.GetDocument() == doc:
-                root[c4d.ID_BASEOBJECT_SCALE] = c4d.Vector(s, s, s)
+        with self._undo_step(doc):
+            for root in list(self._iter_roots(doc.GetFirstObject())):
+                self._apply_root_scale(doc, root)
         c4d.EventAdd()
 
     def get_selected_plasticity_ids(self, doc):
@@ -2270,13 +1791,10 @@ class SceneHandler:
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
         affected  = 0
 
-        doc.StartUndo()
-        try:
+        with self._undo_step(doc):
             for obj in selection:
                 if self._apply_face_sel_tags_to_obj(doc, obj):
                     affected += 1
-        finally:
-            doc.EndUndo()
 
         c4d.EventAdd()
         return affected > 0
@@ -2287,23 +1805,20 @@ class SceneHandler:
             return False
         poly_face_map, face_ids, poly_count = result
 
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE, obj)
         tag = obj.GetFirstTag()
         while tag:
             next_t = tag.GetNext()
             if (tag.CheckType(c4d.Tpolygonselection)
                     and tag.GetName().startswith(MANAGED_FACE_SEL_PREFIX)):
-                doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, tag)
                 tag.Remove()
             tag = next_t
-
-        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
 
         n_groups  = len(face_ids)
         tag_sels  = []
         for group_idx in range(n_groups):
             sel_tag = obj.MakeTag(c4d.Tpolygonselection)
             sel_tag.SetName(f"{MANAGED_FACE_SEL_PREFIX}{group_idx}")
-            doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, sel_tag)
             tag_sels.append(sel_tag.GetBaseSelect())
 
         map_len = min(len(poly_face_map), poly_count)
@@ -2323,13 +1838,10 @@ class SceneHandler:
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
         affected  = 0
 
-        doc.StartUndo()
-        try:
+        with self._undo_step(doc):
             for obj in selection:
                 if self._apply_edge_sel_tags_to_obj(doc, obj):
                     affected += 1
-        finally:
-            doc.EndUndo()
 
         c4d.EventAdd()
         return affected > 0
@@ -2340,34 +1852,23 @@ class SceneHandler:
             return False
         poly_face_map, face_ids, poly_count = result
 
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE, obj)
         tag = obj.GetFirstTag()
         while tag:
             next_t = tag.GetNext()
             if (tag.CheckType(c4d.Tedgeselection)
                     and tag.GetName() == MANAGED_EDGES_TAG_NAME):
-                doc.AddUndo(c4d.UNDOTYPE_DELETEOBJ, tag)
                 tag.Remove()
             tag = next_t
-
-        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
 
         edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
         sel_tag = obj.MakeTag(c4d.Tedgeselection)
         sel_tag.SetName(MANAGED_EDGES_TAG_NAME)
-        doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, sel_tag)
         bs = sel_tag.GetBaseSelect()
 
-        for occurrences in edge_map.values():
-            if len(occurrences) == 1:
-                poly_idx, slot, _ = occurrences[0]
-                bs.Select(poly_idx * 4 + slot)
-            elif len(occurrences) == 2:
-                _, _, g0 = occurrences[0]
-                _, _, g1 = occurrences[1]
-                if g0 != g1:
-                    poly_idx, slot, _ = occurrences[0]
-                    bs.Select(poly_idx * 4 + slot)
+        for poly_idx, slot in geo.boundary_edge_addresses(edge_map):
+            bs.Select(poly_idx * 4 + slot)
 
         obj.Message(c4d.MSG_UPDATE)
         return True
@@ -2377,53 +1878,20 @@ class SceneHandler:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _poly_geometric_normal(obj, cp):
-        a = obj.GetPoint(cp.a)
-        b = obj.GetPoint(cp.b)
-        c = obj.GetPoint(cp.c)
-        n = (b - a).Cross(c - a)
-        length = n.GetLength()
-        return n / length if length > 1e-12 else c4d.Vector(0.0, 1.0, 0.0)
-
-    @staticmethod
     def _get_sharp_edge_addresses(obj, angle_deg=0.0):
         result = _get_poly_face_map_only(obj)
         if result is None:
             return []
         poly_face_map, poly_count = result
 
-        edge_map = _build_edge_map(obj, poly_face_map, poly_count)
-
-        use_angle_filter = angle_deg > 0.0
-        if use_angle_filter:
-            poly_normals = [
-                SceneHandler._poly_geometric_normal(obj, obj.GetPolygon(pi))
-                for pi in range(poly_count)
-            ]
+        polys = _poly_tuples(obj)
+        edge_map = geo.build_edge_map(polys, poly_face_map, poly_count)
+        cos_threshold = None
+        points = None
+        if angle_deg > 0.0:
             cos_threshold = math.cos(math.radians(angle_deg))
-
-        addresses = []
-        for occurrences in edge_map.values():
-            if len(occurrences) == 1:
-                poly_idx, slot, _ = occurrences[0]
-                addresses.append((poly_idx, slot))
-
-            elif len(occurrences) == 2:
-                _, _, g0 = occurrences[0]
-                _, _, g1 = occurrences[1]
-                if g0 == g1:
-                    continue
-
-                if use_angle_filter:
-                    pi0 = occurrences[0][0]
-                    pi1 = occurrences[1][0]
-                    if poly_normals[pi0].Dot(poly_normals[pi1]) >= cos_threshold:
-                        continue
-
-                poly_idx, slot, _ = occurrences[0]
-                addresses.append((poly_idx, slot))
-
-        return addresses
+            points = [(p.x, p.y, p.z) for p in obj.GetAllPoints()]
+        return geo.sharp_edge_addresses(edge_map, polys, points, cos_threshold)
 
     # -------------------------------------------------------------------------
     # Select Sharp Edges
@@ -2437,9 +1905,10 @@ class SceneHandler:
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
         affected = 0
 
-        for obj in selection:
-            if self._select_sharp_edges_on_obj(obj, angle_deg):
-                affected += 1
+        with self._undo_step(doc):
+            for obj in selection:
+                if self._select_sharp_edges_on_obj(doc, obj, angle_deg):
+                    affected += 1
 
         if affected:
             doc.SetMode(c4d.Medges)
@@ -2447,7 +1916,7 @@ class SceneHandler:
 
         return affected > 0
 
-    def _select_sharp_edges_on_obj(self, obj, angle_deg):
+    def _select_sharp_edges_on_obj(self, doc, obj, angle_deg):
         if not obj.CheckType(c4d.Opolygon):
             return False
 
@@ -2455,6 +1924,7 @@ class SceneHandler:
         if not addresses:
             return False
 
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SELECTION, obj)
         edge_sel = obj.GetEdgeS()
         edge_sel.DeselectAll()
         for poly_idx, slot in addresses:
@@ -2474,14 +1944,15 @@ class SceneHandler:
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
         affected  = 0
 
-        for obj in selection:
-            if self._select_plasticity_faces_on_obj(obj):
-                affected += 1
+        with self._undo_step(doc):
+            for obj in selection:
+                if self._select_plasticity_faces_on_obj(doc, obj):
+                    affected += 1
 
         c4d.EventAdd()
         return affected > 0
 
-    def _select_plasticity_faces_on_obj(self, obj):
+    def _select_plasticity_faces_on_obj(self, doc, obj):
         result = _get_poly_face_map_only(obj)
         if result is None:
             return False
@@ -2489,18 +1960,16 @@ class SceneHandler:
 
         poly_sel = obj.GetPolygonS()
         map_len  = min(len(poly_face_map), poly_count)
+        pfm = poly_face_map[:map_len]
 
-        selected_groups = set()
-        for pi in range(map_len):
-            if poly_sel.IsSelected(pi):
-                selected_groups.add(poly_face_map[pi])
-
-        if not selected_groups:
+        selected = [i for i, s in enumerate(poly_sel.GetAll(map_len)) if s]
+        groups, polys = geo.expand_to_groups(pfm, selected)
+        if not groups:
             return False
 
-        for pi in range(map_len):
-            if poly_face_map[pi] in selected_groups:
-                poly_sel.Select(pi)
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SELECTION, obj)
+        for pi in polys:
+            poly_sel.Select(pi)
 
         obj.Message(c4d.MSG_UPDATE)
         return True
@@ -2516,9 +1985,10 @@ class SceneHandler:
         selection = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
         affected  = 0
 
-        for obj in selection:
-            if self._select_plasticity_edges_on_obj(obj):
-                affected += 1
+        with self._undo_step(doc):
+            for obj in selection:
+                if self._select_plasticity_edges_on_obj(doc, obj):
+                    affected += 1
 
         if affected:
             doc.SetMode(c4d.Medges)
@@ -2526,7 +1996,7 @@ class SceneHandler:
 
         return affected > 0
 
-    def _select_plasticity_edges_on_obj(self, obj):
+    def _select_plasticity_edges_on_obj(self, doc, obj):
         result = _get_poly_face_map_only(obj)
         if result is None:
             return False
@@ -2535,32 +2005,19 @@ class SceneHandler:
         poly_sel = obj.GetPolygonS()
         map_len  = min(len(poly_face_map), poly_count)
 
-        selected_groups = set()
-        for pi in range(map_len):
-            if poly_sel.IsSelected(pi):
-                selected_groups.add(poly_face_map[pi])
-
+        selected_groups = {poly_face_map[i] for i, s in
+                           enumerate(poly_sel.GetAll(map_len)) if s}
         if not selected_groups:
             return False
 
         edge_map = _build_edge_map(obj, poly_face_map, poly_count)
 
+        self._add_undo(doc, c4d.UNDOTYPE_CHANGE_SELECTION, obj)
         edge_sel = obj.GetEdgeS()
         edge_sel.DeselectAll()
-
-        for occurrences in edge_map.values():
-            if len(occurrences) == 1:
-                poly_idx, slot, g = occurrences[0]
-                if g in selected_groups:
-                    edge_sel.Select(poly_idx * 4 + slot)
-            elif len(occurrences) == 2:
-                _, _, g0 = occurrences[0]
-                _, _, g1 = occurrences[1]
-                in0 = g0 in selected_groups
-                in1 = g1 in selected_groups
-                if in0 != in1:
-                    poly_idx, slot, _ = occurrences[0]
-                    edge_sel.Select(poly_idx * 4 + slot)
+        for poly_idx, slot in geo.perimeter_edge_addresses(edge_map,
+                                                           selected_groups):
+            edge_sel.Select(poly_idx * 4 + slot)
 
         obj.Message(c4d.MSG_UPDATE)
         return True

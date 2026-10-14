@@ -1,13 +1,22 @@
 """
 Protocol definitions and binary message parsing for Plasticity WebSocket communication.
 
-All message types and binary formats match the Blender addon exactly.
-Uses struct.unpack_from for fast bulk decoding instead of Python loops.
+All message types and binary layouts match the Plasticity Blender Bridge
+(https://github.com/nkallen/plasticity-blender-addon, client.py) exactly:
+little-endian, uint32 length-prefixed UTF-8 strings padded to 4 bytes.
+
+Bulk arrays are read with ``array.frombytes`` (one memcpy) instead of
+per-element unpacking, and written with ``array.tobytes``; on big-endian
+hosts the data is byte-swapped so the wire format stays little-endian.
+Every read is bounds-checked: a truncated or corrupt message raises
+``ProtocolError`` instead of yielding silently short data.
 """
 
 import struct
+import sys
+from array import array
 from enum import IntEnum
-from typing import Tuple, List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MessageType(IntEnum):
@@ -48,20 +57,59 @@ class FacetShapeType(IntEnum):
     CONVEX = 20502
 
 
+class ProtocolError(ValueError):
+    """Raised for truncated or malformed messages."""
+
+
+LIST_TYPES = frozenset({MessageType.LIST_ALL_1, MessageType.LIST_SOME_1,
+                        MessageType.LIST_VISIBLE_1})
+
+_SWAP = sys.byteorder != "little"
+
+
+def _typecode(signed):
+    """Array typecode for a 4-byte (u)int on this platform."""
+    for tc in (("i", "l") if signed else ("I", "L")):
+        if array(tc).itemsize == 4:
+            return tc
+    raise RuntimeError("no 4-byte integer array type on this platform")
+
+
+_I32 = _typecode(True)
+_U32 = _typecode(False)
+_F32 = "f"
+
+_HDR = struct.Struct("<II")
+_U32S = struct.Struct("<I")
+_U64S = struct.Struct("<Q")
+
+
 # =============================================================================
 # Encoding helpers
 # =============================================================================
 
 def _encode_string(s: str) -> bytes:
-    """Encode a UTF-8 string with a uint32 length prefix and 4-byte alignment padding."""
+    """Encode a UTF-8 string with a uint32 byte-length prefix and 4-byte
+    alignment padding.  (The Blender addon uses ``len(str)`` for the prefix
+    in subscribe_some/refacet_some, which is only correct for ASCII; the
+    byte length is what the server reads.)"""
     encoded = s.encode('utf-8')
     padding = b'\x00' * ((4 - len(encoded) % 4) % 4)
-    return struct.pack("<I", len(encoded)) + encoded + padding
+    return _U32S.pack(len(encoded)) + encoded + padding
+
+
+def _array_bytes(typecode, values) -> bytes:
+    a = values if (isinstance(values, array) and values.typecode == typecode) \
+        else array(typecode, values)
+    if _SWAP:
+        a = array(typecode, a)
+        a.byteswap()
+    return a.tobytes()
 
 
 def _encode_id_array(ids: List[int]) -> bytes:
     """Encode a list of uint32 IDs with a uint32 count prefix."""
-    return struct.pack(f"<{len(ids) + 1}I", len(ids), *ids)
+    return _U32S.pack(len(ids)) + _array_bytes(_U32, ids)
 
 
 # =============================================================================
@@ -69,24 +117,24 @@ def _encode_id_array(ids: List[int]) -> bytes:
 # =============================================================================
 
 def encode_list_all(message_id: int) -> bytes:
-    return struct.pack("<II", MessageType.LIST_ALL_1, message_id)
+    return _HDR.pack(MessageType.LIST_ALL_1, message_id)
 
 
 def encode_list_visible(message_id: int) -> bytes:
-    return struct.pack("<II", MessageType.LIST_VISIBLE_1, message_id)
+    return _HDR.pack(MessageType.LIST_VISIBLE_1, message_id)
 
 
 def encode_subscribe_all(message_id: int) -> bytes:
-    return struct.pack("<II", MessageType.SUBSCRIBE_ALL_1, message_id)
+    return _HDR.pack(MessageType.SUBSCRIBE_ALL_1, message_id)
 
 
 def encode_unsubscribe(message_id: int) -> bytes:
-    return struct.pack("<II", MessageType.UNSUBSCRIBE_ALL_1, message_id)
+    return _HDR.pack(MessageType.UNSUBSCRIBE_ALL_1, message_id)
 
 
 def encode_subscribe_some(message_id: int, filename: str,
                           plasticity_ids: List[int]) -> bytes:
-    return (struct.pack("<II", MessageType.SUBSCRIBE_SOME_1, message_id)
+    return (_HDR.pack(MessageType.SUBSCRIBE_SOME_1, message_id)
             + _encode_string(filename)
             + _encode_id_array(plasticity_ids))
 
@@ -99,7 +147,7 @@ def encode_refacet_some(
     min_width=0.0, max_width=0.0, curve_chord_max=0.0,
     shape=FacetShapeType.CUT
 ) -> bytes:
-    return (struct.pack("<II", MessageType.REFACET_SOME_1, message_id)
+    return (_HDR.pack(MessageType.REFACET_SOME_1, message_id)
             + _encode_string(filename)
             + _encode_id_array(plasticity_ids)
             + struct.pack(
@@ -110,13 +158,13 @@ def encode_refacet_some(
                 1 if match_topology else 0,
                 max_sides, plane_angle,
                 min_width, max_width, curve_chord_max,
-                shape.value,
+                int(shape),
             ))
 
 
 def encode_handshake(message_id: int) -> bytes:
     """Encode a HANDSHAKE_1 message (client -> server)."""
-    return struct.pack("<II", MessageType.HANDSHAKE_1, message_id)
+    return _HDR.pack(MessageType.HANDSHAKE_1, message_id)
 
 
 def encode_put_some(message_id: int, filename: str,
@@ -129,59 +177,79 @@ def encode_put_some(message_id: int, filename: str,
         c4d_id, name, parent_c4d_collection_id, existing_stable_id,
         options (uint64), positions (flat float list),
         indices (flat uint32 list), sizes (uint32 list of face vertex counts)
+
+    The payload is assembled as a list of parts joined once (the 1.1.x
+    ``bytes +=`` loop was quadratic in message size).  Raises ``ValueError``
+    for inconsistent mesh data rather than sending a malformed message.
     """
-    msg = struct.pack("<II", MessageType.PUT_SOME_1, message_id)
-
-    # Filename
-    msg += _encode_string(filename)
-
-    # Groups
-    msg += struct.pack("<I", len(groups))
+    parts = [_HDR.pack(MessageType.PUT_SOME_1, message_id),
+             _encode_string(filename),
+             _U32S.pack(len(groups))]
     for g in groups:
-        msg += _encode_string(g["c4d_collection_id"])
-        msg += _encode_string(g["name"])
-        msg += _encode_string(g["parent_c4d_collection_id"])
-        msg += struct.pack("<I", g.get("existing_group_id", 0))
+        parts.append(_encode_string(g["c4d_collection_id"]))
+        parts.append(_encode_string(g["name"]))
+        parts.append(_encode_string(g["parent_c4d_collection_id"]))
+        parts.append(_U32S.pack(g.get("existing_group_id", 0)))
 
-    # Items
-    msg += struct.pack("<I", len(items))
+    parts.append(_U32S.pack(len(items)))
     for item in items:
-        msg += _encode_string(item["c4d_id"])
-        msg += _encode_string(item["name"])
-        msg += _encode_string(item["parent_c4d_collection_id"])
-        msg += struct.pack("<I", item.get("existing_stable_id", 0))
-        msg += struct.pack("<Q", item["options"])  # uint64
-
         positions = item["positions"]
-        vertex_count = len(positions) // 3
-        msg += struct.pack("<I", vertex_count)
-        msg += struct.pack(f"<{len(positions)}f", *positions)
-
         indices = item["indices"]
         sizes = item["sizes"]
-        face_count = len(sizes)
-        index_count = len(indices)
-        msg += struct.pack("<I", face_count)
-        msg += struct.pack("<I", index_count)
-        msg += struct.pack(f"<{index_count}I", *indices)
-        msg += struct.pack(f"<{face_count}I", *sizes)
+        if len(positions) % 3:
+            raise ValueError(f"PUT_SOME item {item['name']!r}: position "
+                             f"count {len(positions)} is not a multiple of 3")
+        vertex_count = len(positions) // 3
+        if sum(sizes) != len(indices):
+            raise ValueError(f"PUT_SOME item {item['name']!r}: face sizes "
+                             f"sum to {sum(sizes)} but there are "
+                             f"{len(indices)} indices")
+        # (negative indices are rejected by the uint32 array below)
+        if indices and max(indices) >= vertex_count:
+            raise ValueError(f"PUT_SOME item {item['name']!r}: index out of "
+                             f"range for {vertex_count} vertices")
 
-    return msg
+        parts.append(_encode_string(item["c4d_id"]))
+        parts.append(_encode_string(item["name"]))
+        parts.append(_encode_string(item["parent_c4d_collection_id"]))
+        parts.append(_U32S.pack(item.get("existing_stable_id", 0)))
+        parts.append(_U64S.pack(item["options"]))
+        parts.append(_U32S.pack(vertex_count))
+        parts.append(_array_bytes(_F32, positions))
+        parts.append(_HDR.pack(len(sizes), len(indices)))
+        try:
+            parts.append(_array_bytes(_U32, indices))
+            parts.append(_array_bytes(_U32, sizes))
+        except OverflowError as e:
+            raise ValueError(f"PUT_SOME item {item['name']!r}: negative or "
+                             f"oversized index/size ({e})") from None
+
+    return b"".join(parts)
 
 
 # =============================================================================
-# Decoding helpers (fast bulk reads)
+# Decoding helpers (bounds-checked bulk reads)
 # =============================================================================
+
+def _need(view, offset, nbytes, what):
+    if offset < 0 or nbytes < 0 or offset + nbytes > len(view):
+        raise ProtocolError(
+            f"truncated message: need {nbytes} bytes for {what} at offset "
+            f"{offset}, have {len(view) - offset}")
+
 
 def _read_u32(view, offset):
-    return struct.unpack_from('<I', view, offset)[0], offset + 4
+    _need(view, offset, 4, "uint32")
+    return _U32S.unpack_from(view, offset)[0], offset + 4
 
 
 def _read_i32(view, offset):
+    _need(view, offset, 4, "int32")
     return struct.unpack_from('<i', view, offset)[0], offset + 4
 
 
 def _read_f32(view, offset):
+    _need(view, offset, 4, "float32")
     return struct.unpack_from('<f', view, offset)[0], offset + 4
 
 
@@ -189,41 +257,41 @@ def _read_string(view, offset):
     length, offset = _read_u32(view, offset)
     if length == 0:
         return "", offset
+    padded = length + (4 - length % 4) % 4
+    _need(view, offset, length, "string")
     raw = bytes(view[offset:offset + length])
     try:
         s = raw.decode('utf-8')
     except UnicodeDecodeError:
         s = raw.decode('utf-8', errors='replace')
-    offset += length
-    offset += (4 - length % 4) % 4  # padding
-    return s, offset
+    # Tolerate a missing final pad only at the very end of the buffer.
+    return s, min(offset + padded, len(view))
+
+
+def _read_array(view, offset, count, typecode, what):
+    nbytes = count * 4
+    _need(view, offset, nbytes, what)
+    a = array(typecode)
+    if count:
+        a.frombytes(view[offset:offset + nbytes])
+        if _SWAP:
+            a.byteswap()
+    return a, offset + nbytes
 
 
 def _read_float_array(view, offset, count):
-    """Read `count` float32 values as a flat list."""
-    if count == 0:
-        return [], offset
-    byte_len = count * 4
-    data = struct.unpack_from(f'<{count}f', view, offset)
-    return list(data), offset + byte_len
+    """Read ``count`` float32 values as an ``array('f')``."""
+    return _read_array(view, offset, count, _F32, "float32 array")
 
 
 def _read_int_array(view, offset, count):
-    """Read `count` int32 values as a flat list."""
-    if count == 0:
-        return [], offset
-    byte_len = count * 4
-    data = struct.unpack_from(f'<{count}i', view, offset)
-    return list(data), offset + byte_len
+    """Read ``count`` int32 values as an ``array`` of signed ints."""
+    return _read_array(view, offset, count, _I32, "int32 array")
 
 
 def _read_uint_array(view, offset, count):
-    """Read `count` uint32 values as a flat list."""
-    if count == 0:
-        return [], offset
-    byte_len = count * 4
-    data = struct.unpack_from(f'<{count}I', view, offset)
-    return list(data), offset + byte_len
+    """Read ``count`` uint32 values as an ``array`` of unsigned ints."""
+    return _read_array(view, offset, count, _U32, "uint32 array")
 
 
 # =============================================================================
@@ -237,6 +305,9 @@ def decode_object_data(view, offset):
     Returns tuple:
         (object_type, object_id, version_id, parent_id, material_id, flags,
          name, vertices, faces, normals, new_offset, groups, face_ids)
+
+    ``vertices``, ``faces`` and ``normals`` are arrays; ``groups`` and
+    ``face_ids`` are plain lists (they are small and get JSON-serialised).
     """
     object_type, offset = _read_u32(view, offset)
     object_id, offset = _read_u32(view, offset)
@@ -268,10 +339,12 @@ def decode_object_data(view, offset):
         # Groups: count then int32 * count
         num_groups, offset = _read_u32(view, offset)
         groups, offset = _read_int_array(view, offset, num_groups)
+        groups = groups.tolist()
 
         # Face IDs: count then int32 * count
         num_face_ids, offset = _read_u32(view, offset)
         face_ids, offset = _read_int_array(view, offset, num_face_ids)
+        face_ids = face_ids.tolist()
 
     elif object_type == ObjectType.GROUP:
         pass  # Groups have no geometry
@@ -300,8 +373,22 @@ def decode_objects(view, offset):
 # Main message parser
 # =============================================================================
 
+def peek_message_type(data) -> Optional[int]:
+    """The raw message type of ``data`` (first uint32), or None."""
+    if len(data) < 4:
+        return None
+    return _U32S.unpack_from(data, 0)[0]
+
+
 class MessageParser:
     def parse_message(self, data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse one server message.
+
+        Returns a dict with at least ``'type'``, or ``None`` for empty or
+        unknown messages.  Server-side failures (code != 200) are returned
+        as dicts with an ``'error'`` key so callers can react to them.
+        Raises ``ProtocolError`` for truncated/malformed input.
+        """
         if len(data) < 4:
             return None
 
@@ -318,18 +405,23 @@ class MessageParser:
         if message_type == MessageType.TRANSACTION_1:
             return self._parse_transaction(view, offset, message_type)
 
-        elif message_type in (MessageType.LIST_ALL_1, MessageType.LIST_SOME_1,
-                              MessageType.LIST_VISIBLE_1):
+        elif message_type in LIST_TYPES:
             message_id, offset = _read_u32(view, offset)
             code, offset = _read_u32(view, offset)
             if code != 200:
                 print(f"[Protocol] List failed with code: {code}")
-                return None
-            return self._parse_transaction(view, offset, message_type)
+                return {'type': message_type, 'message_id': message_id,
+                        'error': code, 'filename': '',
+                        'delete': [], 'add': [], 'update': []}
+            result = self._parse_transaction(view, offset, message_type)
+            result['message_id'] = message_id
+            return result
 
         elif message_type == MessageType.REFACET_SOME_1:
             message_id, offset = _read_u32(view, offset)
-            return self._parse_refacet(view, offset, message_type)
+            result = self._parse_refacet(view, offset, message_type)
+            result['message_id'] = message_id
+            return result
 
         elif message_type == MessageType.NEW_VERSION_1:
             return self._parse_new_version(view, offset)
@@ -344,7 +436,7 @@ class MessageParser:
             return self._parse_put_some(view, offset)
 
         else:
-            print(f"[Protocol] Unhandled message type: {message_type}")
+            print(f"[Protocol] Unhandled message type: {message_type!r}")
             return None
 
     def _parse_transaction(self, view, offset, msg_type):
@@ -366,9 +458,9 @@ class MessageParser:
             item_length, offset = _read_u32(view, offset)
             if item_length == 0:
                 continue
-
+            _need(view, offset, item_length, "transaction item")
             item_view = view[offset:offset + item_length]
-            item_type_raw = struct.unpack_from('<I', item_view, 0)[0]
+            item_type_raw, _ = _read_u32(item_view, 0)
 
             try:
                 item_type = MessageType(item_type_raw)
@@ -377,10 +469,12 @@ class MessageParser:
                 continue
 
             if item_type == MessageType.DELETE_1:
-                num_deleted = struct.unpack_from('<I', item_view, 4)[0]
-                for i in range(num_deleted):
-                    del_id = struct.unpack_from('<I', item_view, 8 + i * 4)[0]
-                    transaction['delete'].append(del_id)
+                # [type][count][ids...]; the Blender addon reads the count
+                # from offset 0 (the type field) — a bug there — but takes
+                # the IDs from offset 8, matching this layout.
+                num_deleted, _ = _read_u32(item_view, 4)
+                ids, _ = _read_uint_array(item_view, 8, num_deleted)
+                transaction['delete'].extend(ids.tolist())
 
             elif item_type in (MessageType.ADD_1, MessageType.UPDATE_1):
                 objects, _ = decode_objects(item_view, 4)
@@ -396,7 +490,8 @@ class MessageParser:
         code, offset = _read_u32(view, offset)
         if code != 200:
             print(f"[Protocol] Refacet failed with code {code}")
-            return {'type': msg_type, 'error': code, 'refaceted_objects': []}
+            return {'type': msg_type, 'error': code, 'filename': '',
+                    'refaceted_objects': []}
 
         filename, offset = _read_string(view, offset)
         file_version, offset = _read_u32(view, offset)
@@ -428,7 +523,8 @@ class MessageParser:
             items.append({
                 'plasticity_id': plasticity_id, 'version': version,
                 'faces': faces, 'vertices': vertices, 'indices': indices,
-                'normals': normals, 'groups': groups, 'face_ids': face_ids,
+                'normals': normals, 'groups': groups.tolist(),
+                'face_ids': face_ids.tolist(),
             })
 
         return {
@@ -455,44 +551,48 @@ class MessageParser:
         """Parse HANDSHAKE_1 response (server -> client)."""
         message_id, offset = _read_u32(view, offset)
         num_messages, offset = _read_u32(view, offset)
-
-        supported = set()
-        for _ in range(num_messages):
-            msg_type, offset = _read_u32(view, offset)
-            supported.add(msg_type)
+        types, offset = _read_uint_array(view, offset, num_messages)
 
         return {
             'type': MessageType.HANDSHAKE_1,
             'message_id': message_id,
-            'supported_messages': supported,
+            'supported_messages': set(types.tolist()),
         }
 
     def _parse_put_some(self, view, offset):
-        """Parse PUT_SOME_1 response (server -> client)."""
+        """Parse PUT_SOME_1 response (server -> client).
+
+        On a non-200 code the result arrays may be absent; whatever cannot
+        be read is reported as empty instead of failing the whole message.
+        """
         message_id, offset = _read_u32(view, offset)
         code, offset = _read_u32(view, offset)
 
-        num_groups, offset = _read_u32(view, offset)
         group_results = []
-        for _ in range(num_groups):
-            collection_id, offset = _read_string(view, offset)
-            group_id, offset = _read_u32(view, offset)
-            group_results.append({
-                "c4d_collection_id": collection_id,
-                "group_id": group_id,
-            })
-
-        num_items, offset = _read_u32(view, offset)
         item_results = []
-        for _ in range(num_items):
-            c4d_id, offset = _read_string(view, offset)
-            stable_id, offset = _read_u32(view, offset)
-            version_id, offset = _read_u32(view, offset)
-            item_results.append({
-                "c4d_id": c4d_id,
-                "stable_id": stable_id,
-                "version_id": version_id,
-            })
+        try:
+            num_groups, offset = _read_u32(view, offset)
+            for _ in range(num_groups):
+                collection_id, offset = _read_string(view, offset)
+                group_id, offset = _read_u32(view, offset)
+                group_results.append({
+                    "c4d_collection_id": collection_id,
+                    "group_id": group_id,
+                })
+
+            num_items, offset = _read_u32(view, offset)
+            for _ in range(num_items):
+                c4d_id, offset = _read_string(view, offset)
+                stable_id, offset = _read_u32(view, offset)
+                version_id, offset = _read_u32(view, offset)
+                item_results.append({
+                    "c4d_id": c4d_id,
+                    "stable_id": stable_id,
+                    "version_id": version_id,
+                })
+        except ProtocolError:
+            if code == 200:
+                raise
 
         return {
             'type': MessageType.PUT_SOME_1,

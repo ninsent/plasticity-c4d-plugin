@@ -13,26 +13,117 @@ import sys
 # Registered Plugin ID from plugincafe.maxon.net
 PLUGIN_ID = 1066929
 
-# Get plugin directory
-plugin_dir = os.path.dirname(__file__)
-
-# Add plugin directory and libs to path BEFORE any imports
-if plugin_dir not in sys.path:
-    sys.path.insert(0, plugin_dir)
+plugin_dir = os.path.dirname(os.path.abspath(__file__))
 libs_path = os.path.join(plugin_dir, "libs")
-if libs_path not in sys.path:
-    sys.path.insert(0, libs_path)
+
+# Development only: set PLASTICITY_BRIDGE_DEV=1 before starting Cinema 4D to
+# reload the plugin's modules on "Reload Python Plugins".  Maxon recommends
+# against autoReload in release builds.
+_DEV_RELOAD = os.environ.get("PLASTICITY_BRIDGE_DEV") == "1"
+
+try:
+    # Cinema 4D 2024.0+: puts the path on sys.path only while importing and
+    # refuses to import over a same-named package another plugin loaded
+    # (suggested by Maxon SDK support for this plugin).
+    from mxutils import LocalImportPath as _ImportPath
+except ImportError:
+    _ImportPath = None
+
+
+class _LegacyImportPath:
+    """Cinema 4D 2023 stand-in for ``mxutils.LocalImportPath``.
+
+    Same contract: ``path`` is on ``sys.path`` only inside the ``with``
+    block, and a package of the same name that is already loaded from
+    another location raises ``ImportError`` instead of being reused.
+    """
+
+    def __init__(self, path, autoReload=False):
+        self._path = path if os.path.isdir(path) else os.path.dirname(path)
+        self._added = False
+
+    def __enter__(self):
+        for name in sorted(os.listdir(self._path)):
+            pkg = os.path.join(self._path, name)
+            if not os.path.isfile(os.path.join(pkg, "__init__.py")):
+                continue
+            loaded = sys.modules.get(name)
+            if loaded is None:
+                continue
+            origin = getattr(loaded, "__file__", None)
+            if origin is None or not os.path.abspath(origin).startswith(
+                    os.path.abspath(pkg) + os.sep):
+                raise ImportError(
+                    f"Encountered module label collision for '{name}': "
+                    f"already loaded from {origin}")
+        if self._path not in sys.path:
+            sys.path.insert(0, self._path)
+            self._added = True
+        return self
+
+    def __exit__(self, *exc):
+        if self._added:
+            try:
+                sys.path.remove(self._path)
+            except ValueError:
+                pass
+        return False
+
+
+if _ImportPath is None:
+    _ImportPath = _LegacyImportPath
+
+
+def _load_websockets():
+    """Import the bundled websockets 10.4 from libs/.
+
+    Returns True when the bundled copy is used.  If another plugin already
+    imported its own ``websockets``, keep using that one (as 1.1.x silently
+    did) but say so in the console.
+    """
+    try:
+        with _ImportPath(libs_path):
+            import websockets.client  # noqa: F401
+            import websockets.exceptions  # noqa: F401
+        return True
+    except ImportError as e:
+        if "collision" not in str(e):
+            raise
+        import websockets
+        print(f"[Plasticity Bridge] Warning: using websockets "
+              f"{getattr(websockets, '__version__', '?')} from "
+              f"{getattr(websockets, '__file__', '?')}, loaded by another "
+              f"plugin, instead of the bundled 10.4")
+        return False
+
+
+class _NoImportPath:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 # Resource handler for description files (required by RegisterTagPlugin)
 __res__ = c4d.plugins.GeResource()
 __res__.Init(plugin_dir)
 
 # Now try to import modules with error handling
+__version__ = "?"
 try:
-    from core.client import PlasticityClient
-    from core.handler import SceneHandler
-    from core.threading_bridge import ThreadingBridge
-    from dialogs.main_dialog import PlasticityDialog
+    _bundled_websockets = _load_websockets()
+    # libs/ stays on the path while the plugin imports — and, in dev mode,
+    # while LocalImportPath(autoReload=True) reloads every module under the
+    # plugin folder on exit, the bundled websockets included.
+    with (_ImportPath(libs_path) if _bundled_websockets else _NoImportPath()), \
+            _ImportPath(plugin_dir, autoReload=_DEV_RELOAD):
+        from core.version import __version__
+        from core.client import PlasticityClient
+        from core.handler import SceneHandler
+        from core.threading_bridge import ThreadingBridge
+        from dialogs.main_dialog import PlasticityDialog
+        from core.refacet_tag import register_refacet_tag
     IMPORT_SUCCESS = True
     IMPORT_ERROR = None
 except Exception as e:
@@ -62,7 +153,7 @@ class PlasticityCommand(c4d.plugins.CommandData):
             self.threading_bridge = ThreadingBridge()
             self.handler = SceneHandler(self.threading_bridge)
             self.client = PlasticityClient(self.handler, self.threading_bridge)
-            # v2.1.0: back-reference so handler can invoke client methods
+            # Back-reference so the handler can invoke client methods
             self.handler.client = self.client
             self.dialog = PlasticityDialog(
                 self.client, self.handler, self.threading_bridge
@@ -100,18 +191,30 @@ class PlasticityCommand(c4d.plugins.CommandData):
         return c4d.CMD_ENABLED
 
     def shutdown(self):
-        """Clean shutdown of all resources."""
-        if self.client and self.client.connected:
+        """Clean shutdown of all resources (C4DPL_ENDACTIVITY).
+
+        Stops the timer, closes the connection — also one that is still
+        being established — and waits a bounded time for the WebSocket
+        thread to exit.  The thread is a daemon, so a stuck socket can never
+        block Cinema 4D from quitting.
+        """
+        if self.dialog is not None:
             try:
-                self.client.disconnect()
+                self.dialog.SetTimer(0)
+            except Exception:
+                pass
+        if self.client is not None:
+            try:
+                self.client.shutdown(timeout=2.0)
             except Exception as e:
                 print(f"[Plasticity Bridge] Shutdown error: {e}")
 
 
 def PluginMessage(id, data):
     """Handle plugin messages."""
-    global _command_instance
     if id == c4d.C4DPL_ENDACTIVITY:
+        # Maxon: "This allows to close dialogs, end threads, delete
+        # temporary/undo buffers etc." (Python SDK, Plugin Structure).
         if _command_instance:
             _command_instance.shutdown()
     return True
@@ -138,14 +241,13 @@ if __name__ == "__main__":
     )
 
     if result:
-        print("[Plasticity Bridge] Plugin registered successfully (ID: 1066929)")
+        print(f"[Plasticity Bridge] {__version__} registered (ID: {PLUGIN_ID})")
     else:
         print("[Plasticity Bridge] Failed to register plugin")
 
     # Register the auto-refacet tag plugin
     if IMPORT_SUCCESS:
         try:
-            from core.refacet_tag import register_refacet_tag
             register_refacet_tag(icon, __res__)
         except Exception as e:
             print(f"[Plasticity Bridge] Failed to register refacet tag: {e}")
