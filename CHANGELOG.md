@@ -4,54 +4,31 @@ All notable changes to Plasticity Cinema 4D Bridge will be documented in this fi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
-## [Unreleased]
-
-Version 1.2.0 (see `plasticity_bridge/core/version.py`). Audit findings are referenced as F-numbers; see `AUDIT.md`.
+## [1.2.0] - 2026-10-14
 
 ### Fixed
-- **Maxon's MCP server starts again with Plasticity Bridge installed.** On Cinema 4D 2026.4 it failed with `ImportError: cannot import name 'ServerProtocol' from 'websockets.server'`. All Python plugins share one interpreter, and the bridge exposed its bundled websockets 10.4 under the global name `websockets`, together with generic `core` and `dialogs` modules. The plugin now loads as one private package and leaves no global modules behind; nothing other plugins import can be shadowed (F30).
-- **Multi-part control cages upload completely.** 1.1.x passed several objects to `MCOMMAND_JOIN`. JOIN only joins the children of the object it is given, so only the first part was uploaded. Cage parts are now merged in Python (F01).
-- **Offset and rotated cage children keep their placement.** Child, cache and deform-cache matrices are baked into the uploaded points, and points are expressed relative to the Plasticity root, which inverts unit scale and any root move. 1.1.x dropped every matrix except the SDS's (F03).
-- **The CSTO fallback uses the command's result list.** 1.1.x ignored it (F02).
-- **Only the first child of a Subdivision Surface is uploaded**, matching what Cinema 4D subdivides. A note is printed when an SDS has more children (F04).
-- **N-gons upload as single faces** instead of triangle/quad fragments. N-gons with holes fall back to fragments with a warning (F05).
-- **Deformers are honoured for single-polygon cages too** (F12).
-- **Refresh no longer stays disabled forever.** This used to happen after a failed list, an unreadable response or a failed send. Every busy operation now ends on a response, an error or a disconnect, with a 120 s safety timeout (F06).
-- **A refacet error no longer creates an empty "Plasticity" root null** (F07).
-- **Live Link never drops updates.** The event queue is unbounded and a backlog is reported in the console (F08).
-- **Cinema 4D no longer freezes while sending.** Sends are non-blocking, and failures are reported in the status line. Disconnecting no longer blocks for up to 5 s (F09).
-- **Reconnecting no longer breaks the new connection.** Double-clicking Connect, or reconnecting quickly, could start two connections, or let the closing one reset the new one (F10).
-- **Wrong face groups after an N-gon refacet with only tris/quads**, which affected the Select/Store utilities (F13).
-- **Custom normals use Cinema 4D's int16 scale of 32000.** 1.1.x used 32767, which made normals about 2.4 % too long (F14).
-- **N-gon melting no longer changes the object's polygon selection** (F15).
-- **"Only Visible" respects hidden parents and layers** (F17).
-- **Copies of uploaded Outbox objects upload as new objects** instead of overwriting the original (F18).
-- **Outbox IDs no longer hide unrelated Inbox objects.** Items and groups have overlapping IDs (F19). Uploaded IDs are now tracked per Plasticity file (F47). A copy of an Inbox mesh used as an Outbox cage no longer stops the original from syncing (F46). A copy of an uploaded object that arrives over Live Link before the upload finishes is removed from the Inbox (F20).
-- **Malformed geometry can no longer crash Cinema 4D.** Polygons that reference missing vertices are skipped (F21).
-- **An auto-refresh no longer cancels a pending Outbox upload** (F22).
-- **Scenes from before 1.1.0 migrate into the Inbox again.** The migration was broken in 1.1.6 (F45).
-- **Deleting the Outbox null no longer creates a second, empty Inbox** (F44).
-- **Changing Unit Scale updates every Plasticity root in the scene**, including ones not seen since connecting (F32).
-- **Closing the dialog or quitting Cinema 4D** shuts the connection down cleanly, even while it is still connecting (F29).
+- **Maxon MCP server** — the MCP server in Cinema 4D 2026.4+ starts with the bridge installed.
+- **Outbox uploads** — Plasticity gets what you see under the SDS: multi-part cages, moved children, deformers, fresh generators and real N-gons. Only the first child counts, as in C4D.
+- **Outbox copies** — copies upload as new objects, and the Outbox can't hide, freeze or duplicate Inbox objects. Only Visible respects hidden parents and layers.
+- **Live Link stability** — C4D stays responsive and catches every edit. Refresh always recovers from errors and keeps its Outbox upload.
+- **Connecting** — fast reconnects work, and closing the dialog or quitting C4D disconnects cleanly.
+- **Refacet** — after an N-gon refacet the face tools pick the right faces and your selection survives. Normals have the right length, and errors leave no stray null.
+- **Scene fixes** — pre-1.1.0 scenes migrate into the Inbox again, deleting the Outbox doesn't spawn a second Inbox, and Unit Scale reaches every root.
+- **Bad geometry** — broken polygons are skipped instead of risking a crash.
 
 ### Changed
-- **Undo.** Every incoming update (list, Live Link transaction, refacet) is exactly one undo step. N-gon melting happens inside that step. Updates that change nothing leave no step. Name, visibility and selection changes made by the plugin and its utilities are undoable (F11, F23, F24).
-- **Auto-Refacet tessellates once per update.** Tagged objects skip the intermediate triangle rebuild, so an update produces one rebuild and one undo step. The triangle data is applied if the refacet fails (F11).
-- **New plugin layout: all code lives in the private package `plasticity_bridge/`.** That covers `core/`, `dialogs/`, and the bundled websockets under `plasticity_bridge/_vendor/`. The package is loaded by file location, without touching `sys.path`, and the bridge always uses its own websockets. **When upgrading by hand, delete the old `PlasticityBridge` folder first**: the old `core/`, `dialogs/` and `libs/` folders are no longer used. Set `PLASTICITY_BRIDGE_DEV=1` to re-import the package on "Reload Python Plugins" while developing (F30).
-- **Poly-face maps are stored run-length encoded**: about 600 bytes instead of about 3.8 MB for a 1M-polygon object. Maps written by 1.1.x are still read.
-- **Every skipped Outbox object is reported** in the console and in the status line (F16).
-- **The version is printed when the plugin loads**, from a single source of truth (`plasticity_bridge/core/version.py`).
-- **Performance.** Messages decode 90–140× faster. Multi-object uploads are encoded up to about 490× faster, because 1.1.x was quadratic in the number of objects. Normals are built about 5× faster. Points are written with `SetAllPoints`. See `AUDIT.md` for the numbers.
+- **Upgrading** — delete the old `PlasticityBridge` folder before unzipping. The code now lives in `plasticity_bridge/`. Scenes from 1.1.x open as before.
+- **Undo** — one step per Plasticity update, none when nothing changed. Selection tools undo too.
+- **Auto-Refacet** — tagged objects tessellate once per update, straight to the final mesh.
+- **Speed** — large models import and upload much faster, and scenes save smaller.
+- **Console** — prints the plugin version on load and names skipped Outbox objects.
 
 ### Added
-- A pytest suite (protocol golden bytes, threading, client against a local WebSocket server, geometry, handler and Outbox via a `c4d` stub) and GitHub Actions CI on Python 3.9, 3.10 and 3.11.
-- `scripts/build_release.py`: a deterministic release zip with an allowlist and a self-check, plus a release workflow that only runs when started by hand.
-- The bundled websockets license (`plasticity_bridge/_vendor/websockets/LICENSE`).
-- `AUDIT.md` and `docs/MANUAL_TEST_CHECKLIST.md`.
+- Tests, CI and a reproducible release build for plugin developers. Full list of fixes in `AUDIT.md`.
+- License file for the bundled websockets library.
 
 ### Removed
-- `speedups.c` and `py.typed` are no longer shipped. The C extension was never compiled, so nothing changes at runtime.
-- The `libs/` folder (the bundled websockets moved to `plasticity_bridge/_vendor/`).
+- Unused files from the download, like a leftover C source and `.DS_Store` files.
 
 ## [1.1.6] - 2026-06-13
 

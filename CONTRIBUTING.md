@@ -45,7 +45,7 @@ python tests/perf/bench.py --sizes 100000       # optional: before/after timings
 - CI runs the tests on Python 3.9, 3.10 and 3.11 — the Python versions embedded in Cinema 4D 2023.0/2023.1, 2023.2 and 2024–2026 — so don't use newer syntax.
 
 ### Imports
-Cinema 4D runs **every** Python plugin in one interpreter with one shared `sys.modules`, so a module this plugin imports under a global name is what every other plugin — and Cinema 4D itself — gets for that name (1.2.0-dev broke Maxon's MCP server by exposing its bundled websockets 10.4 as `websockets`; see `AUDIT.md`, F30).
+Cinema 4D runs **every** Python plugin in one interpreter with one shared `sys.modules`, so a module this plugin imports under a global name is what every other plugin — and Cinema 4D itself — gets for that name (versions before 1.2.0 broke Maxon's MCP server by exposing their bundled websockets 10.4 as `websockets`; see `AUDIT.md`, F30).
 
 - **Never modify `sys.path`** in plugin code. `plasticity_c4d.pyp` loads the package by file location (`importlib.util.spec_from_file_location`); tests may change `sys.path`, the plugin may not.
 - **All plugin code lives in `plasticity_bridge/`** and imports its own modules **relatively** (`from .protocol import …`, `from ..core.threading_bridge import …`). No new top-level packages next to the `.pyp`.
@@ -66,7 +66,7 @@ Cinema 4D runs **every** Python plugin in one interpreter with one shared `sys.m
 
 ### Releases
 1. Bump `__version__` in `plasticity_bridge/core/version.py` (the single source of truth — the plugin prints it on load, the build script names the zip after it).
-2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD` and start a new empty `## [Unreleased]` above it.
+2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`. The next change adds a fresh `## [Unreleased]` section when it needs one.
 3. Build and check locally:
    ```bash
    python scripts/build_release.py --release

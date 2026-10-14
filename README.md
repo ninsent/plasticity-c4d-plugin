@@ -235,9 +235,9 @@ Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md)
 
 ## Changelog
 
-### [Unreleased] — 1.2.0
+### [1.2.0] - 2026-10-14
 
-- Audit release: correct multi-part / offset / N-gon Outbox uploads, non-blocking networking, no dropped Live Link updates, one undo step per update, single-pass Auto-Refacet, much faster import/export, test suite, CI and reproducible release builds. See [AUDIT.md](AUDIT.md)
+- Works with Maxon's MCP server, Outbox uploads that match what you see in C4D, steadier Live Link, one undo step per update, faster import and upload, new `plasticity_bridge/` folder layout
 
 ### [1.1.6] - 2026-06-13
 
