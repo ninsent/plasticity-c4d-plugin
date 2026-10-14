@@ -10,9 +10,9 @@ import time
 
 import pytest
 
-from core.client import PlasticityClient
-from core.protocol import MessageType
-from core.threading_bridge import EventType, ThreadingBridge
+from plasticity_bridge.core.client import PlasticityClient
+from plasticity_bridge.core.protocol import MessageType
+from plasticity_bridge.core.threading_bridge import EventType, ThreadingBridge
 from fake_server import FakePlasticityServer, default_responder
 import wire as W
 
@@ -321,7 +321,7 @@ def test_shutdown_joins_threads():
 
 def test_receive_error_ends_session_instead_of_spinning(monkeypatch):
     """F26: a non-close exception from recv() used to be retried forever."""
-    import websockets.legacy.protocol as proto
+    import plasticity_bridge._vendor.websockets.legacy.protocol as proto
     calls = []
 
     async def broken_recv(self):
@@ -343,7 +343,7 @@ def test_disconnect_racing_with_connect_never_leaves_stale_connected(monkeypatch
     """Disconnect lands right after the socket opened but before the session
     is marked connected: the bridge must end up disconnected, with no
     CONNECTED event after DISCONNECTED."""
-    import core.client as C
+    import plasticity_bridge.core.client as C
     client, bridge, rec = make_client()
     real_proxy = C.weakref.proxy
 

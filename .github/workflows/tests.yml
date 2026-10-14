@@ -25,7 +25,9 @@ jobs:
       - name: Install dev dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run tests
-        run: python -m pytest --cov=core --cov=dialogs --cov-report=term-missing
+        # Coverage of the plugin package; plasticity_bridge/_vendor is
+        # excluded in .coveragerc.
+        run: python -m pytest --cov=plasticity_bridge --cov-report=term-missing
 
   build:
     name: Release zip (self-check)

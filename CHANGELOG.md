@@ -6,9 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
-Version 1.2.0 (see `core/version.py`). Audit findings are referenced as F-numbers; see `AUDIT.md`.
+Version 1.2.0 (see `plasticity_bridge/core/version.py`). Audit findings are referenced as F-numbers; see `AUDIT.md`.
 
 ### Fixed
+- **Maxon's MCP server starts again with Plasticity Bridge installed.** On Cinema 4D 2026.4 it failed with `ImportError: cannot import name 'ServerProtocol' from 'websockets.server'`. All Python plugins share one interpreter, and the bridge exposed its bundled websockets 10.4 under the global name `websockets`, together with generic `core` and `dialogs` modules. The plugin now loads as one private package and leaves no global modules behind; nothing other plugins import can be shadowed (F30).
 - **Multi-part control cages upload completely.** 1.1.x passed several objects to `MCOMMAND_JOIN`. JOIN only joins the children of the object it is given, so only the first part was uploaded. Cage parts are now merged in Python (F01).
 - **Offset and rotated cage children keep their placement.** Child, cache and deform-cache matrices are baked into the uploaded points, and points are expressed relative to the Plasticity root, which inverts unit scale and any root move. 1.1.x dropped every matrix except the SDS's (F03).
 - **The CSTO fallback uses the command's result list.** 1.1.x ignored it (F02).
@@ -36,21 +37,21 @@ Version 1.2.0 (see `core/version.py`). Audit findings are referenced as F-number
 ### Changed
 - **Undo.** Every incoming update (list, Live Link transaction, refacet) is exactly one undo step. N-gon melting happens inside that step. Updates that change nothing leave no step. Name, visibility and selection changes made by the plugin and its utilities are undoable (F11, F23, F24).
 - **Auto-Refacet tessellates once per update.** Tagged objects skip the intermediate triangle rebuild, so an update produces one rebuild and one undo step. The triangle data is applied if the refacet fails (F11).
-- **Plugin loading uses `mxutils.LocalImportPath` on Cinema 4D 2024+**, with an equivalent fallback on 2023. The plugin no longer leaves its folders on `sys.path`. A clash with another plugin's `core`/`dialogs` package is reported instead of silently importing the wrong code. Set `PLASTICITY_BRIDGE_DEV=1` to reload modules on "Reload Python Plugins" while developing (F30).
+- **New plugin layout: all code lives in the private package `plasticity_bridge/`.** That covers `core/`, `dialogs/`, and the bundled websockets under `plasticity_bridge/_vendor/`. The package is loaded by file location, without touching `sys.path`, and the bridge always uses its own websockets. **When upgrading by hand, delete the old `PlasticityBridge` folder first**: the old `core/`, `dialogs/` and `libs/` folders are no longer used. Set `PLASTICITY_BRIDGE_DEV=1` to re-import the package on "Reload Python Plugins" while developing (F30).
 - **Poly-face maps are stored run-length encoded**: about 600 bytes instead of about 3.8 MB for a 1M-polygon object. Maps written by 1.1.x are still read.
 - **Every skipped Outbox object is reported** in the console and in the status line (F16).
-- **The version is printed when the plugin loads**, from a single source of truth (`core/version.py`).
+- **The version is printed when the plugin loads**, from a single source of truth (`plasticity_bridge/core/version.py`).
 - **Performance.** Messages decode 90–140× faster. Multi-object uploads are encoded up to about 490× faster, because 1.1.x was quadratic in the number of objects. Normals are built about 5× faster. Points are written with `SetAllPoints`. See `AUDIT.md` for the numbers.
 
 ### Added
 - A pytest suite (protocol golden bytes, threading, client against a local WebSocket server, geometry, handler and Outbox via a `c4d` stub) and GitHub Actions CI on Python 3.9, 3.10 and 3.11.
 - `scripts/build_release.py`: a deterministic release zip with an allowlist and a self-check, plus a release workflow that only runs when started by hand.
-- The bundled websockets license (`libs/websockets/LICENSE`).
-- `AUDIT.md`.
+- The bundled websockets license (`plasticity_bridge/_vendor/websockets/LICENSE`).
+- `AUDIT.md` and `docs/MANUAL_TEST_CHECKLIST.md`.
 
 ### Removed
 - `speedups.c` and `py.typed` are no longer shipped. The C extension was never compiled, so nothing changes at runtime.
-- The unused `libs/__init__.py`.
+- The `libs/` folder (the bundled websockets moved to `plasticity_bridge/_vendor/`).
 
 ## [1.1.6] - 2026-06-13
 

@@ -7,10 +7,10 @@ import array
 import c4d
 import pytest
 
-from core import geometry as g
-from core import handler as H
-from core.protocol import MessageParser, encode_put_some
-from core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
+from plasticity_bridge.core import geometry as g
+from plasticity_bridge.core import handler as H
+from plasticity_bridge.core.protocol import MessageParser, encode_put_some
+from plasticity_bridge.core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
 from meshgen import ngon_grid, tri_grid
 from reference import handler_v116 as ref
 import wire as W

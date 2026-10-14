@@ -4,9 +4,9 @@ import math
 
 import pytest
 
-from core.protocol import FacetShapeType, encode_refacet_some
-from core.refacet_settings import build_refacet_kwargs
-from core import refacet_tag as T
+from plasticity_bridge.core.protocol import FacetShapeType, encode_refacet_some
+from plasticity_bridge.core.refacet_settings import build_refacet_kwargs
+from plasticity_bridge.core import refacet_tag as T
 
 
 def _dialog_1_1_6(tri_mode, advanced, tol, ang, minw, maxw, a, b, c, d):

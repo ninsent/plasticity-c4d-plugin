@@ -20,20 +20,21 @@ import weakref
 from typing import List, Optional
 
 try:
-    import websockets.client as ws_client
-    from websockets.exceptions import ConnectionClosed
+    # Bundled copy only, never the global ``websockets`` (shared interpreter).
+    from .._vendor.websockets import client as ws_client
+    from .._vendor.websockets.exceptions import ConnectionClosed
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
     print("[Plasticity] Warning: websockets library not found")
 
-from core.protocol import (
+from .protocol import (
     MessageType, MessageParser, LIST_TYPES, peek_message_type,
     encode_list_all, encode_list_visible, encode_subscribe_all,
     encode_subscribe_some, encode_unsubscribe, encode_refacet_some,
     encode_handshake, encode_put_some,
 )
-from core.threading_bridge import (
+from .threading_bridge import (
     ThreadingBridge, BridgeEvent, EventType, StatusReporter,
 )
 

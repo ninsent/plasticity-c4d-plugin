@@ -108,7 +108,7 @@ Only objects inside the Inbox are kept in sync. Re-parenting an object inside th
 3. Restart Cinema 4D
 4. The plugin appears under **Extensions → Plasticity Bridge**; the Console shows `[Plasticity Bridge] <version> registered`
 
-**Upgrading:** quit Cinema 4D and replace the old `PlasticityBridge` folder with the new one (delete it first, so no stale files remain). Scenes saved with earlier versions keep working.
+**Upgrading:** quit Cinema 4D, **delete the old `PlasticityBridge` folder**, then unzip the new one. Since 1.2.0 all code lives in `PlasticityBridge/plasticity_bridge/`; unzipping over an old install would leave the unused `core/`, `dialogs/` and `libs/` folders behind. Scenes saved with earlier versions keep working.
 
 > **Upgrading from 1.1.0:** the Auto-Refacet tag plugin ID has changed to a registered Maxon ID. Scenes saved with 1.1.0 will lose their Auto-Refacet tag bindings on load — re-apply the tag via the **Auto-Refacet** checkbox in the Basic tab.
 
@@ -130,9 +130,9 @@ New-Item -ItemType SymbolicLink -Path "$env:APPDATA\Maxon\Cinema 4D\plugins\plas
 
 3. Restart Cinema 4D. The plugin will appear under **Extensions → Plasticity Bridge**
 
-No build step or `pip install` needed — the `websockets` library (10.4, pure Python) is bundled in `libs/`.
+No build step or `pip install` needed — all plugin code is the package `plasticity_bridge/`, with the `websockets` library (10.4, pure Python) bundled privately in `plasticity_bridge/_vendor/`. Cinema 4D runs every Python plugin in one interpreter, so the plugin never adds folders to `sys.path` and never imports anything under a generic global name (see [CONTRIBUTING.md](CONTRIBUTING.md#imports)).
 
-To reload the plugin's modules with *Extensions → Reload Python Plugins* instead of restarting Cinema 4D (2024+), start Cinema 4D with the environment variable `PLASTICITY_BRIDGE_DEV=1`.
+To re-import the plugin's modules with *Extensions → Reload Python Plugins* instead of restarting Cinema 4D, start Cinema 4D with the environment variable `PLASTICITY_BRIDGE_DEV=1` (close the Plasticity Bridge dialog before reloading).
 
 #### Tests
 
@@ -143,7 +143,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Behaviour that depends on Cinema 4D itself still has to be checked by hand in Cinema 4D.
+Things only Cinema 4D can verify are listed in [docs/MANUAL_TEST_CHECKLIST.md](docs/MANUAL_TEST_CHECKLIST.md).
 
 #### Building a release
 
@@ -151,7 +151,7 @@ Behaviour that depends on Cinema 4D itself still has to be checked by hand in Ci
 python scripts/build_release.py
 ```
 
-This writes `dist/PlasticityBridge_v<version>.zip` (version from `core/version.py`), containing only the files the plugin needs, and prints its size and SHA-256. See [CONTRIBUTING.md](CONTRIBUTING.md#releases) for the release process.
+This writes `dist/PlasticityBridge_v<version>.zip` (version from `plasticity_bridge/core/version.py`), containing only the files the plugin needs, and prints its size and SHA-256. See [CONTRIBUTING.md](CONTRIBUTING.md#releases) for the release process.
 
 ---
 

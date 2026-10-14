@@ -5,7 +5,7 @@ import random
 
 import pytest
 
-from core import geometry as g
+from plasticity_bridge.core import geometry as g
 from meshgen import ngon_grid, tri_grid
 
 

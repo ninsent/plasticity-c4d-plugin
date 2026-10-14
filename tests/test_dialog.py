@@ -3,9 +3,9 @@
 import c4d
 import pytest
 
-from core.protocol import MessageType
-from core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
-from dialogs.main_dialog import IDS, PlasticityDialog
+from plasticity_bridge.core.protocol import MessageType
+from plasticity_bridge.core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
+from plasticity_bridge.dialogs.main_dialog import IDS, PlasticityDialog
 
 
 class FakeClient:

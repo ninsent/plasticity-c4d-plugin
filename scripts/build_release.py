@@ -7,7 +7,8 @@ Build the Plasticity Bridge release zip.
 
 Standard library only; works on Windows, macOS and Linux.
 
-* The version comes from core/version.py (single source of truth).
+* The version comes from plasticity_bridge/core/version.py (single source
+  of truth).
 * CHANGELOG.md must describe that version: a ``## [<version>]`` section, or
   — for pre-release builds only — a non-empty ``## [Unreleased]`` section
   while <version> is newer than every released entry.  ``--release`` (used
@@ -37,24 +38,31 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOP_FOLDER = "PlasticityBridge"
 ZIP_NAME = "PlasticityBridge_v{version}.zip"
+VERSION_FILE = "plasticity_bridge/core/version.py"
 
 # (directory relative to the repo root, glob patterns, recurse?)
+# All plugin code is in the private package plasticity_bridge/ (vendored
+# libraries under plasticity_bridge/_vendor/); nothing else is a package.
 ALLOWLIST = [
     ("", ["plasticity_c4d.pyp", "LICENSE", "readme.txt"], False),
-    ("core", ["*.py"], False),
-    ("dialogs", ["*.py"], False),
-    ("libs/websockets", ["*.py", "LICENSE"], True),
+    ("plasticity_bridge", ["*.py"], True),
+    ("plasticity_bridge/_vendor/websockets", ["LICENSE"], False),
     ("res", ["*.h", "*.res", "*.str", "*.tif"], True),
 ]
 
+_PKG = "plasticity_bridge/"
+_WS = _PKG + "_vendor/websockets/"
 REQUIRED = [
     "plasticity_c4d.pyp", "LICENSE", "readme.txt",
-    "core/__init__.py", "core/client.py", "core/geometry.py",
-    "core/handler.py", "core/protocol.py", "core/refacet_settings.py",
-    "core/refacet_tag.py", "core/threading_bridge.py", "core/version.py",
-    "dialogs/__init__.py", "dialogs/main_dialog.py",
-    "libs/websockets/__init__.py", "libs/websockets/client.py",
-    "libs/websockets/legacy/client.py", "libs/websockets/LICENSE",
+    _PKG + "__init__.py", _PKG + "_vendor/__init__.py",
+    _PKG + "core/__init__.py", _PKG + "core/client.py",
+    _PKG + "core/geometry.py", _PKG + "core/handler.py",
+    _PKG + "core/protocol.py", _PKG + "core/refacet_settings.py",
+    _PKG + "core/refacet_tag.py", _PKG + "core/threading_bridge.py",
+    VERSION_FILE,
+    _PKG + "dialogs/__init__.py", _PKG + "dialogs/main_dialog.py",
+    _WS + "__init__.py", _WS + "client.py", _WS + "legacy/client.py",
+    _WS + "LICENSE",
     "res/c4d_symbols.h", "res/icon.tif",
     "res/description/tplasticityrefacet.h",
     "res/description/tplasticityrefacet.res",
@@ -79,7 +87,7 @@ class BuildError(Exception):
 # =============================================================================
 
 def read_version(root=ROOT):
-    path = os.path.join(root, "core", "version.py")
+    path = os.path.join(root, *VERSION_FILE.split("/"))
     with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read(), path)
     for node in tree.body:
@@ -87,9 +95,9 @@ def read_version(root=ROOT):
                 and getattr(node.targets[0], "id", None) == "__version__"):
             version = ast.literal_eval(node.value)
             if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-                raise BuildError(f"core/version.py: {version!r} is not X.Y.Z")
+                raise BuildError(f"{VERSION_FILE}: {version!r} is not X.Y.Z")
             return version
-    raise BuildError("core/version.py has no __version__ = '...' assignment")
+    raise BuildError(f"{VERSION_FILE} has no __version__ = '...' assignment")
 
 
 _HEADING = re.compile(r"^## \[(?P<name>[^\]]+)\](?P<rest>.*)$", re.M)
@@ -140,7 +148,7 @@ def release_notes(version, release=False, root=ROOT):
     if newest and _vtuple(version) <= _vtuple(newest):
         raise BuildError(f"CHANGELOG.md has no '## [{version}]' section and "
                          f"{version} is not newer than the latest release "
-                         f"({newest}) — bump core/version.py")
+                         f"({newest}) — bump {VERSION_FILE}")
     print(f"note: {version} is not released yet; release notes come from "
           f"'## [Unreleased]' (use --release to require a dated entry)")
     return f"## [{version}] - Unreleased\n\n{unreleased}\n"
@@ -283,7 +291,7 @@ def main(argv=None):
     try:
         version = read_version()
         if args.tag is not None and args.tag != f"v{version}":
-            raise BuildError(f"tag {args.tag!r} does not match core/version.py "
+            raise BuildError(f"tag {args.tag!r} does not match {VERSION_FILE} "
                              f"(expected 'v{version}')")
         notes = release_notes(version, release=args.release)
 

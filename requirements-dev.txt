@@ -1,5 +1,10 @@
 # Development / CI only — never shipped with the plugin.
 # The plugin itself runs in Cinema 4D's embedded Python and only uses the
-# standard library plus the bundled libs/websockets.
+# standard library plus its private copy of websockets 10.4
+# (plasticity_bridge/_vendor/websockets).
 pytest>=7.4,<9
 pytest-cov>=4.1,<7
+# A *newer* global websockets + uvicorn, as Maxon's MCP server uses them:
+# tests/test_plugin_entry.py proves both coexist with the bridge.
+websockets>=13
+uvicorn>=0.35

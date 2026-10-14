@@ -9,8 +9,8 @@ from array import array
 
 import pytest
 
-from core import protocol as P
-from core.protocol import FacetShapeType, MessageParser, MessageType, ProtocolError
+from plasticity_bridge.core import protocol as P
+from plasticity_bridge.core.protocol import FacetShapeType, MessageParser, MessageType, ProtocolError
 from reference import blender_v221 as B
 from reference import protocol_v116 as OLD
 import wire as W

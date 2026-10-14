@@ -64,10 +64,10 @@ import uuid
 
 import c4d
 
-from core import geometry as geo
-from core.protocol import ObjectType, MessageType, LIST_TYPES
-from core.threading_bridge import ThreadingBridge, BridgeEvent, EventType
-from core.refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
+from . import geometry as geo
+from .protocol import ObjectType, MessageType, LIST_TYPES
+from .threading_bridge import ThreadingBridge, BridgeEvent, EventType
+from .refacet_tag import TAG_PLUGIN_ID as REFACET_TAG_ID, read_tag_refacet_kwargs
 
 # BaseContainer keys — offsets from registered plugin ID 1066929.
 # Never change these: they are stored in users' scenes.

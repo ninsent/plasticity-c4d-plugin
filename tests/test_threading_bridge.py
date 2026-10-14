@@ -3,7 +3,7 @@
 import threading
 import time
 
-from core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
+from plasticity_bridge.core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
 
 
 def _ev(i, t=EventType.TRANSACTION):

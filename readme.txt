@@ -19,8 +19,9 @@ Copy this entire PlasticityBridge folder to your Cinema 4D plugins directory:
 Restart Cinema 4D. The plugin appears under Extensions > Plasticity Bridge,
 and the Console shows "[Plasticity Bridge] <version> registered".
 
-To upgrade, quit Cinema 4D and replace the old PlasticityBridge folder with
-this one (delete the old folder first).
+To upgrade, quit Cinema 4D, delete the old PlasticityBridge folder, then copy
+this one in its place (since 1.2.0 the code lives in plasticity_bridge/;
+the old core/, dialogs/ and libs/ folders are no longer used).
 
 Closing the Plasticity Bridge window disconnects from Plasticity.
 
@@ -41,5 +42,6 @@ https://github.com/ninsent/plasticity-c4d-plugin
 
 Third-party code
 ----------------
-libs/websockets: websockets 10.4, (c) Aymeric Augustin and contributors,
-BSD 3-Clause license - see libs/websockets/LICENSE.
+plasticity_bridge/_vendor/websockets: websockets 10.4, (c) Aymeric Augustin
+and contributors, BSD 3-Clause license - see
+plasticity_bridge/_vendor/websockets/LICENSE.

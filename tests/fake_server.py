@@ -11,7 +11,7 @@ import asyncio
 import struct
 import threading
 
-import websockets.server
+from plasticity_bridge._vendor.websockets import server as ws_server
 
 import wire as W
 
@@ -66,8 +66,8 @@ class FakePlasticityServer:
 
     async def _main(self):
         self._stop = self._loop.create_future()
-        async with websockets.server.serve(self._handler, "127.0.0.1", 0,
-                                           max_size=2 ** 32 - 1) as server:
+        async with ws_server.serve(self._handler, "127.0.0.1", 0,
+                                   max_size=2 ** 32 - 1) as server:
             self.port = server.sockets[0].getsockname()[1]
             self._ready.set()
             await self._stop

@@ -12,10 +12,10 @@ import c4d
 import math
 import time
 from c4d import gui
-from core.threading_bridge import EventType, BridgeEvent
-from core.protocol import MessageType
-from core.refacet_settings import build_refacet_kwargs
-from core.refacet_tag import (
+from ..core.threading_bridge import EventType, BridgeEvent
+from ..core.protocol import MessageType
+from ..core.refacet_settings import build_refacet_kwargs
+from ..core.refacet_tag import (
     TAG_PLUGIN_ID as REFACET_TAG_ID,
     PREF_TOPOLOGY, PREF_TOPOLOGY_TRIS, PREF_TOPOLOGY_NGONS,
     PREF_OPTIONS_MODE, PREF_OPTIONS_SIMPLE, PREF_OPTIONS_ADVANCED,

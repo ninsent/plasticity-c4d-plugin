@@ -1,0 +1,5 @@
+[run]
+source = plasticity_bridge
+# Third-party code bundled unmodified (websockets 10.4).
+omit =
+    plasticity_bridge/_vendor/*

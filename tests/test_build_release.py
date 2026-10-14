@@ -35,9 +35,14 @@ def test_zip_layout_and_allowlist(built):
     forbidden = ("tests/", "scripts/", ".github/", "README.md", "CONTRIBUTING.md",
                  "AUDIT.md", "CHANGELOG.md", "requirements-dev.txt", "pytest.ini",
                  "speedups.c", "py.typed", ".pyc", "__pycache__", ".DS_Store",
-                 ".gitignore")
+                 "docs/", ".gitignore", ".coveragerc")
     for f in shipped:
         assert not any(x in f for x in forbidden), f
+    # One private package; no generic top-level packages in the plugin folder.
+    tops = {f.split("/", 1)[0] for f in shipped}
+    assert tops == {"plasticity_c4d.pyp", "LICENSE", "readme.txt",
+                    "plasticity_bridge", "res"}, tops
+    assert "plasticity_bridge/_vendor/websockets/LICENSE" in shipped
 
 
 def test_build_is_deterministic(built):
@@ -63,10 +68,14 @@ def test_crlf_checkouts_build_identical_zip(tmp_path, built):
         if os.path.splitext(rel)[1] in (".py", ".pyp", ".h", ".res", ".str", ".txt", ""):
             raw = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
         dst.write_bytes(raw)
-    (tmp_path / "core" / "__pycache__").mkdir()
-    (tmp_path / "core" / "__pycache__" / "x.cpython-311.pyc").write_bytes(b"x")
+    (tmp_path / "plasticity_bridge" / "core" / "__pycache__").mkdir()
+    (tmp_path / "plasticity_bridge" / "core" / "__pycache__" / "x.cpython-311.pyc").write_bytes(b"x")
     (tmp_path / "res" / ".DS_Store").write_bytes(b"x")
-    (tmp_path / "libs" / "websockets" / "speedups.c").write_bytes(b"x")
+    ws = tmp_path / "plasticity_bridge" / "_vendor" / "websockets"
+    (ws / "speedups.c").write_bytes(b"x")
+    (ws / "py.typed").write_bytes(b"")
+    (ws / "__pycache__").mkdir()
+    (ws / "__pycache__" / "client.cpython-311.pyc").write_bytes(b"x")
     rebuilt = br.build_zip_bytes(br.collect_files(str(tmp_path)), str(tmp_path))
     assert rebuilt == data
 
@@ -91,10 +100,11 @@ def test_self_check_byte_compiles(built, monkeypatch):
     with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as dst:
         for info in src.infolist():
             payload = src.read(info.filename)
-            if info.filename.endswith("core/handler.py"):
+            if info.filename.endswith("plasticity_bridge/core/handler.py"):
                 payload += b"\ndef broken(:\n"
             dst.writestr(info, payload)
-    with pytest.raises(br.BuildError, match="syntax error in core/handler.py"):
+    with pytest.raises(br.BuildError,
+                       match="syntax error in plasticity_bridge/core/handler.py"):
         br.self_check(buf.getvalue())
 
 
@@ -113,8 +123,9 @@ CHANGELOG = """# Changelog
 
 
 def _repo_with(tmp_path, changelog, version):
-    (tmp_path / "core").mkdir()
-    (tmp_path / "core" / "version.py").write_text(f'__version__ = "{version}"\n')
+    (tmp_path / "plasticity_bridge" / "core").mkdir(parents=True)
+    (tmp_path / "plasticity_bridge" / "core" / "version.py").write_text(
+        f'__version__ = "{version}"\n')
     (tmp_path / "CHANGELOG.md").write_text(changelog)
     return str(tmp_path)
 

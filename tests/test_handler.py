@@ -8,12 +8,12 @@ import json
 import c4d
 import pytest
 
-from core import geometry as g
-from core import handler as H
-from core.protocol import MessageParser
-from core.refacet_tag import TAG_PLUGIN_ID, PREF_TOPOLOGY, PREF_OPTIONS_MODE, \
+from plasticity_bridge.core import geometry as g
+from plasticity_bridge.core import handler as H
+from plasticity_bridge.core.protocol import MessageParser
+from plasticity_bridge.core.refacet_tag import TAG_PLUGIN_ID, PREF_TOPOLOGY, PREF_OPTIONS_MODE, \
     PREF_TOLERANCE, PREF_ANGLE, PREF_MIN_WIDTH, PREF_MAX_WIDTH
-from core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
+from plasticity_bridge.core.threading_bridge import BridgeEvent, EventType, ThreadingBridge
 from meshgen import ngon_grid, tri_grid
 import wire as W
 
@@ -765,7 +765,7 @@ def test_refacet_send_failure_event_applies_stash(env):
     response arrives as OPERATION_FAILED and must not leave objects stale."""
     h, bridge, client, doc = env
     obj = _tagged_pending(env)
-    from core.protocol import MessageType
+    from plasticity_bridge.core.protocol import MessageType
     send(bridge, EventType.OPERATION_FAILED,
          {"operation": MessageType.REFACET_SOME_1})
     assert obj.GetPolygonCount() == 40 and not h._pending_auto_refacet
@@ -811,7 +811,7 @@ def test_upload_callback_error_does_not_block_auto_refacet(env):
 def test_list_operation_failed_clears_refresh_callback(env):
     """Review finding 4: a failed Refresh must not upload on a later list."""
     h, bridge, client, doc = env
-    from core.protocol import MessageType
+    from plasticity_bridge.core.protocol import MessageType
     client.on_list_complete = lambda fn: pytest.fail("stale upload")
     send(bridge, EventType.OPERATION_FAILED, {"operation": MessageType.LIST_ALL_1})
     assert client.on_list_complete is None

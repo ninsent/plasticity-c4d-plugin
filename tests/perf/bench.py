@@ -21,16 +21,16 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = os.path.dirname(HERE)
 ROOT = os.path.dirname(TESTS)
-for p in (os.path.join(TESTS, "stubs"), ROOT, os.path.join(ROOT, "libs"), TESTS):
+for p in (os.path.join(TESTS, "stubs"), ROOT, TESTS):
     if p not in sys.path:
         sys.path.insert(0, p)
 
 import c4d  # noqa: E402  (stub)
 
-from core import geometry as g  # noqa: E402
-from core import protocol as P  # noqa: E402
-from core.handler import SceneHandler  # noqa: E402
-from core.threading_bridge import ThreadingBridge  # noqa: E402
+from plasticity_bridge.core import geometry as g  # noqa: E402
+from plasticity_bridge.core import protocol as P  # noqa: E402
+from plasticity_bridge.core.handler import SceneHandler  # noqa: E402
+from plasticity_bridge.core.threading_bridge import ThreadingBridge  # noqa: E402
 from meshgen import ngon_grid, tri_grid, tris_for_target  # noqa: E402
 from reference import handler_v116 as OLD_H  # noqa: E402
 from reference import protocol_v116 as OLD_P  # noqa: E402

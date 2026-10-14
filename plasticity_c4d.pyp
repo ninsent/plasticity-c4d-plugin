@@ -7,6 +7,7 @@ Ported to Cinema 4D Python SDK.
 """
 
 import c4d
+import importlib.util
 import os
 import sys
 
@@ -14,95 +15,67 @@ import sys
 PLUGIN_ID = 1066929
 
 plugin_dir = os.path.dirname(os.path.abspath(__file__))
-libs_path = os.path.join(plugin_dir, "libs")
 
-# Development only: set PLASTICITY_BRIDGE_DEV=1 before starting Cinema 4D to
-# reload the plugin's modules on "Reload Python Plugins".  Maxon recommends
-# against autoReload in release builds.
+# All plugin code lives in the uniquely named package ``plasticity_bridge``
+# next to this file.  Cinema 4D runs every Python plugin in one interpreter,
+# so this file never adds a folder to the import path and nothing is ever
+# imported under a generic global name (``core``, ``dialogs``,
+# ``websockets`` …): such names leak into every other plugin.  Up to
+# 1.2.0-dev the bundled websockets 10.4 was imported as ``websockets`` and
+# broke Maxon's MCP server, whose uvicorn needs websockets >= 11.
+_PACKAGE = "plasticity_bridge"
+_PACKAGE_DIR = os.path.join(plugin_dir, _PACKAGE)
+
+# Development only: with PLASTICITY_BRIDGE_DEV=1 set before starting
+# Cinema 4D, "Reload Python Plugins" re-imports the whole package from disk
+# instead of reusing the loaded modules.  Close the Plasticity Bridge dialog
+# (disconnect) before reloading.
 _DEV_RELOAD = os.environ.get("PLASTICITY_BRIDGE_DEV") == "1"
 
-try:
-    # Cinema 4D 2024.0+: puts the path on sys.path only while importing and
-    # refuses to import over a same-named package another plugin loaded
-    # (suggested by Maxon SDK support for this plugin).
-    from mxutils import LocalImportPath as _ImportPath
-except ImportError:
-    _ImportPath = None
+
+def _unload_package():
+    """Drop ``plasticity_bridge`` and all its submodules from sys.modules."""
+    for name in [n for n in sys.modules
+                 if n == _PACKAGE or n.startswith(_PACKAGE + ".")]:
+        del sys.modules[name]
 
 
-class _LegacyImportPath:
-    """Cinema 4D 2023 stand-in for ``mxutils.LocalImportPath``.
+def _same_dir(a, b):
+    return (os.path.normcase(os.path.realpath(a))
+            == os.path.normcase(os.path.realpath(b)))
 
-    Same contract: ``path`` is on ``sys.path`` only inside the ``with``
-    block, and a package of the same name that is already loaded from
-    another location raises ``ImportError`` instead of being reused.
+
+def _load_package():
+    """Import ``plasticity_bridge`` from this folder by its file location.
+
+    Returns True if this call loaded it (False if the copy loaded earlier
+    from this same folder is reused).  Submodules — including the vendored
+    ``plasticity_bridge._vendor.websockets`` — are then found through the
+    package's ``__path__``; the global import path is never consulted.
     """
+    loaded = sys.modules.get(_PACKAGE)
+    if loaded is not None:
+        origin = os.path.dirname(getattr(loaded, "__file__", None) or "")
+        if not origin or not _same_dir(origin, _PACKAGE_DIR):
+            raise ImportError(
+                f"another '{_PACKAGE}' package is already loaded from "
+                f"{origin or 'an unknown location'} — is Plasticity Bridge "
+                f"installed twice?")
+        if not _DEV_RELOAD:
+            return False
+        _unload_package()
 
-    def __init__(self, path, autoReload=False):
-        self._path = path if os.path.isdir(path) else os.path.dirname(path)
-        self._added = False
-
-    def __enter__(self):
-        for name in sorted(os.listdir(self._path)):
-            pkg = os.path.join(self._path, name)
-            if not os.path.isfile(os.path.join(pkg, "__init__.py")):
-                continue
-            loaded = sys.modules.get(name)
-            if loaded is None:
-                continue
-            origin = getattr(loaded, "__file__", None)
-            if origin is None or not os.path.abspath(origin).startswith(
-                    os.path.abspath(pkg) + os.sep):
-                raise ImportError(
-                    f"Encountered module label collision for '{name}': "
-                    f"already loaded from {origin}")
-        if self._path not in sys.path:
-            sys.path.insert(0, self._path)
-            self._added = True
-        return self
-
-    def __exit__(self, *exc):
-        if self._added:
-            try:
-                sys.path.remove(self._path)
-            except ValueError:
-                pass
-        return False
-
-
-if _ImportPath is None:
-    _ImportPath = _LegacyImportPath
-
-
-def _load_websockets():
-    """Import the bundled websockets 10.4 from libs/.
-
-    Returns True when the bundled copy is used.  If another plugin already
-    imported its own ``websockets``, keep using that one (as 1.1.x silently
-    did) but say so in the console.
-    """
+    spec = importlib.util.spec_from_file_location(
+        _PACKAGE, os.path.join(_PACKAGE_DIR, "__init__.py"),
+        submodule_search_locations=[_PACKAGE_DIR])
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[_PACKAGE] = package
     try:
-        with _ImportPath(libs_path):
-            import websockets.client  # noqa: F401
-            import websockets.exceptions  # noqa: F401
-        return True
-    except ImportError as e:
-        if "collision" not in str(e):
-            raise
-        import websockets
-        print(f"[Plasticity Bridge] Warning: using websockets "
-              f"{getattr(websockets, '__version__', '?')} from "
-              f"{getattr(websockets, '__file__', '?')}, loaded by another "
-              f"plugin, instead of the bundled 10.4")
-        return False
-
-
-class _NoImportPath:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+        spec.loader.exec_module(package)
+    except BaseException:
+        sys.modules.pop(_PACKAGE, None)
+        raise
+    return True
 
 
 # Resource handler for description files (required by RegisterTagPlugin)
@@ -111,22 +84,20 @@ __res__.Init(plugin_dir)
 
 # Now try to import modules with error handling
 __version__ = "?"
+_loaded_here = False
 try:
-    _bundled_websockets = _load_websockets()
-    # libs/ stays on the path while the plugin imports — and, in dev mode,
-    # while LocalImportPath(autoReload=True) reloads every module under the
-    # plugin folder on exit, the bundled websockets included.
-    with (_ImportPath(libs_path) if _bundled_websockets else _NoImportPath()), \
-            _ImportPath(plugin_dir, autoReload=_DEV_RELOAD):
-        from core.version import __version__
-        from core.client import PlasticityClient
-        from core.handler import SceneHandler
-        from core.threading_bridge import ThreadingBridge
-        from dialogs.main_dialog import PlasticityDialog
-        from core.refacet_tag import register_refacet_tag
+    _loaded_here = _load_package()
+    from plasticity_bridge.core.version import __version__
+    from plasticity_bridge.core.client import PlasticityClient
+    from plasticity_bridge.core.handler import SceneHandler
+    from plasticity_bridge.core.threading_bridge import ThreadingBridge
+    from plasticity_bridge.dialogs.main_dialog import PlasticityDialog
+    from plasticity_bridge.core.refacet_tag import register_refacet_tag
     IMPORT_SUCCESS = True
     IMPORT_ERROR = None
 except Exception as e:
+    if _loaded_here:
+        _unload_package()        # leave nothing half-imported behind
     IMPORT_SUCCESS = False
     IMPORT_ERROR = str(e)
     print(f"[Plasticity Bridge] Import error: {e}")

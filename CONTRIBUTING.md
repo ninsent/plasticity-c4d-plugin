@@ -40,9 +40,16 @@ python -m pytest
 python tests/perf/bench.py --sizes 100000       # optional: before/after timings
 ```
 
-- Keep geometry and protocol logic in the c4d-free modules (`core/geometry.py`, `core/protocol.py`, `core/refacet_settings.py`) so it can be tested; the C4D-facing code in `core/handler.py` should stay a thin layer.
-- Add a regression test for every bug fix. Behaviour that can only be checked inside Cinema 4D has to be tested by hand before a release.
+- Keep geometry and protocol logic in the c4d-free modules (`plasticity_bridge/core/geometry.py`, `protocol.py`, `refacet_settings.py`) so it can be tested; the C4D-facing code in `plasticity_bridge/core/handler.py` should stay a thin layer.
+- Add a regression test for every bug fix. Behaviour that can only be checked inside Cinema 4D goes into [docs/MANUAL_TEST_CHECKLIST.md](docs/MANUAL_TEST_CHECKLIST.md); `tests/test_docs.py` checks that every `M-…` ID cited in `AUDIT.md` exists there.
 - CI runs the tests on Python 3.9, 3.10 and 3.11 — the Python versions embedded in Cinema 4D 2023.0/2023.1, 2023.2 and 2024–2026 — so don't use newer syntax.
+
+### Imports
+Cinema 4D runs **every** Python plugin in one interpreter with one shared `sys.modules`, so a module this plugin imports under a global name is what every other plugin — and Cinema 4D itself — gets for that name (1.2.0-dev broke Maxon's MCP server by exposing its bundled websockets 10.4 as `websockets`; see `AUDIT.md`, F30).
+
+- **Never modify `sys.path`** in plugin code. `plasticity_c4d.pyp` loads the package by file location (`importlib.util.spec_from_file_location`); tests may change `sys.path`, the plugin may not.
+- **All plugin code lives in `plasticity_bridge/`** and imports its own modules **relatively** (`from .protocol import …`, `from ..core.threading_bridge import …`). No new top-level packages next to the `.pyp`.
+- **Never import a third-party library by its global name.** Vendor it unmodified under `plasticity_bridge/_vendor/<name>/` (with its license) and import it as `from .._vendor.<name> import …`. Check first that the library only uses relative imports internally.
 
 ### Compatibility rules
 - Never change the plugin IDs (`1066929`, `1068209`), the `BC_PLASTICITY_*` BaseContainer keys (`1066930`–`1066942`), the managed tag names, or the tag description IDs in `res/description/tplasticityrefacet.h` — they are stored in users' scenes.
@@ -58,35 +65,38 @@ python tests/perf/bench.py --sizes 100000       # optional: before/after timings
    - How to test the changes (including any manual checks in Cinema 4D)
 
 ### Releases
-1. Bump `__version__` in `core/version.py` (the single source of truth — the plugin prints it on load, the build script names the zip after it).
+1. Bump `__version__` in `plasticity_bridge/core/version.py` (the single source of truth — the plugin prints it on load, the build script names the zip after it).
 2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD` and start a new empty `## [Unreleased]` above it.
 3. Build and check locally:
    ```bash
    python scripts/build_release.py --release
    ```
    This writes `dist/PlasticityBridge_vX.Y.Z.zip` (one top-level `PlasticityBridge/` folder, allowlisted runtime files only), byte-compiles every Python file, and prints the size and SHA-256. Rebuilding the same commit gives a byte-identical zip. Without `--release`, a build of an unreleased version is allowed if its changes are described under `[Unreleased]`.
-4. Test that zip by hand in Cinema 4D.
-5. Push a tag `vX.Y.Z`, then run the *Release* workflow by hand (*Actions → Release → Run workflow*, enter the tag). It runs the tests, checks that the tag matches `core/version.py`, rebuilds the zip and publishes it on the GitHub Release with the matching CHANGELOG section as release notes. Pushing commits or tags never publishes anything on its own.
+4. Run through [docs/MANUAL_TEST_CHECKLIST.md](docs/MANUAL_TEST_CHECKLIST.md) in Cinema 4D with that zip.
+5. Push a tag `vX.Y.Z`, then run the *Release* workflow by hand (*Actions → Release → Run workflow*, enter the tag). It runs the tests, checks that the tag matches `plasticity_bridge/core/version.py`, rebuilds the zip and publishes it on the GitHub Release with the matching CHANGELOG section as release notes. Pushing commits or tags never publishes anything on its own.
 
 ### Project Structure
 ```
 plasticity-c4d-plugin/
-├── plasticity_c4d.pyp         # Plugin entry point, imports, command and tag registration
-├── dialogs/
+├── plasticity_c4d.pyp         # Entry point: loads plasticity_bridge by file location, registers command and tag
+├── plasticity_bridge/         # ALL plugin code — one private package (see "Imports")
 │   ├── __init__.py
-│   └── main_dialog.py         # UI layout, state, and user commands
-├── core/
-│   ├── __init__.py
-│   ├── client.py              # WebSocket client (handshake, non-blocking sends, async loop)
-│   ├── geometry.py            # c4d-free geometry: conversion, N-gons, normals, face maps, export
-│   ├── handler.py             # Scene handler: C4D objects, hierarchy, undo, utilities, auto-refacet
-│   ├── protocol.py            # Binary protocol encoding/decoding (all message types)
-│   ├── refacet_settings.py    # Refacet settings → request parameters (dialog and tag)
-│   ├── refacet_tag.py         # Auto-Refacet TagData plugin
-│   ├── threading_bridge.py    # Thread-safe event bridge to main thread
-│   └── version.py             # Plugin version (single source of truth)
-├── libs/
-│   └── websockets/            # Bundled websockets 10.4 (BSD license in libs/websockets/LICENSE)
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── client.py              # WebSocket client (handshake, non-blocking sends, async loop)
+│   │   ├── geometry.py            # c4d-free geometry: conversion, N-gons, normals, face maps, export
+│   │   ├── handler.py             # Scene handler: C4D objects, hierarchy, undo, utilities, auto-refacet
+│   │   ├── protocol.py            # Binary protocol encoding/decoding (all message types)
+│   │   ├── refacet_settings.py    # Refacet settings → request parameters (dialog and tag)
+│   │   ├── refacet_tag.py         # Auto-Refacet TagData plugin
+│   │   ├── threading_bridge.py    # Thread-safe event bridge to main thread
+│   │   └── version.py             # Plugin version (single source of truth)
+│   ├── dialogs/
+│   │   ├── __init__.py
+│   │   └── main_dialog.py         # UI layout, state, and user commands
+│   └── _vendor/
+│       ├── __init__.py
+│       └── websockets/            # Bundled websockets 10.4, unmodified (BSD license in websockets/LICENSE)
 ├── res/
 │   ├── icon.tif               # Plugin icon (also used for the tag)
 │   ├── c4d_symbols.h
@@ -99,6 +109,7 @@ plasticity-c4d-plugin/
 │           └── tplasticityrefacet.str  # Auto-Refacet tag display names
 ├── tests/                     # pytest suite (c4d stub, references, fake server) — not shipped
 ├── scripts/build_release.py   # Release zip builder — not shipped
+├── docs/MANUAL_TEST_CHECKLIST.md  # Checks only Cinema 4D can do — not shipped
 ├── .github/workflows/         # CI (tests) and the manual release workflow
 ├── AUDIT.md
 ├── CHANGELOG.md

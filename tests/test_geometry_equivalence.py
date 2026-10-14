@@ -10,7 +10,7 @@ import random
 import c4d
 import pytest
 
-from core import geometry as g
+from plasticity_bridge.core import geometry as g
 from reference import handler_v116 as ref
 from meshgen import ngon_grid, tri_grid
 

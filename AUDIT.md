@@ -9,8 +9,8 @@ The reference for protocol behaviour is the Plasticity Blender Bridge,
 
 Cinema 4D API claims below were checked against Maxon's documentation and
 developer forum; the sources are listed in [Sources](#sources). Anything
-that could only be inferred is marked **(inferred)** and needs a manual
-check in Cinema 4D (IDs `M-…`).
+that could only be inferred is marked **(inferred)** and has an entry in
+[`docs/MANUAL_TEST_CHECKLIST.md`](docs/MANUAL_TEST_CHECKLIST.md) (IDs `M-…`).
 
 **Severity scale.**
 
@@ -59,7 +59,7 @@ the test or manual check named. *Deferred* gives a reason.
 | F27 | Low | Threading | Re-entrant dispatch while a modal dialog is open | Fixed |
 | F28 | Low | Quality | "v2.1.0" comments refer to plugin 1.1.x features | Fixed |
 | F29 | Low | Lifecycle | Close/reopen/exit: blocking disconnect, the "connecting" state is not shut down | Fixed |
-| F30 | Medium | Loading | Generic `core`/`dialogs` packages and `libs` inserted at `sys.path[0]` | Fixed |
+| F30 | High | Loading | Plugin modules (`core`, `dialogs`, `websockets`) leak into C4D's shared interpreter; breaks Maxon's MCP server | Fixed |
 | F31 | Low | Import | `ResizeObject(p, v, 0)`: the third argument is undocumented in Python | Fixed (defensive) |
 | F32 | Low | UI | `update_unit_scale` only touches cached roots | Fixed |
 | F33 | Low | UI | The Timer re-applies ~25 gadget states and the status text every 16 ms | Fixed |
@@ -293,15 +293,43 @@ the test or manual check named. *Deferred* gives a reason.
 * **Fix:** only set the slot when a callback is passed, and clear it when a list fails.
 * **Test:** `test_client.py::test_list_without_callback_keeps_pending_callback`, `test_handler.py::test_list_error_does_not_touch_scene_and_clears_callback`.
 
-### F30 — Generic package names and `libs` inserted at `sys.path[0]`
+### F30 — plugin modules leak into Cinema 4D's shared interpreter (broke Maxon's MCP server)
 
-* **Where:** `plasticity_c4d.pyp:20-25`.
-* **What:** the plugin directory and `libs` are put at the front of the shared `sys.path`, and the code is imported as the top-level packages `core`, `dialogs` and `websockets`.
-  * Another plugin with a `core` package, loaded first, makes this plugin import the wrong code.
-  * A different `websockets` version may be picked up, either theirs or ours.
-  * The order depends on plugin load order.
-* **Fix:** load through `mxutils.LocalImportPath` where available, as Maxon SDK support recommended for this plugin; it also allows reloading modules during development. Cinema 4D 2023 has no `mxutils`, so it uses a small fallback with the same contract. The `sys.path` entries are not left behind. If another plugin has already loaded a different `websockets`, that copy is used with a console warning, which is what 1.1.x did silently. `PLASTICITY_BRIDGE_DEV=1` enables `autoReload` for development only.
-* **Tests:** `test_plugin_entry.py`. Manual checks: the setup section and `M-DEV-1`.
+* **Severity:** High. The first version of this audit rated it Medium; the MCP report below shows the impact.
+* **Where:**
+  * 1.1.6: `plasticity_c4d.pyp:20-25` put the plugin folder and `libs/` at the front of `sys.path`, then imported `core`, `dialogs` and `websockets` as top-level modules.
+  * 1.2.0-dev (commit `b6d3cf5`): the same three modules, now imported through `mxutils.LocalImportPath` or its `_LegacyImportPath` fallback.
+* **What:** all Python plugins in Cinema 4D share one interpreter and one `sys.modules`. Whatever is first imported as `websockets` is what every later `import websockets` in the process gets.
+  * **Reported failure, Cinema 4D 2026.4 on Windows:** Maxon's built-in MCP server never started while the bridge was installed. Its uvicorn does `from websockets.server import ServerProtocol`, which needs websockets 11 or newer, and got the bridge's bundled 10.4: `ImportError: cannot import name 'ServerProtocol' from 'websockets.server' (...\plugins\PlasticityBridge\libs\websockets\server.py)`.
+  * **Generic names collide:** `core` and `dialogs` clash the same way with any other plugin using those names.
+  * **Reverse load order:** if another plugin loaded a newer websockets first, the bridge used that copy and its deprecated legacy client API.
+* **Why the first fix (`b6d3cf5`) was not enough:** `LocalImportPath` and the 2023 fallback only take the folder off `sys.path` after the `with` block. Modules imported inside the block stay in `sys.modules`; Maxon's docs say the class "will not overwrite existing modules". At best it turned a clash into an error message. It never took the plugin's names out of the shared namespace. The old `test_plugin_entry.py` even asserted that the global `websockets` came from `libs/`, which locked the bug in.
+* **Fix:**
+  * **One private package.** All plugin code lives in the uniquely named `plasticity_bridge/`: `core/`, `dialogs/`, and the vendored websockets 10.4 under `plasticity_bridge/_vendor/websockets/`. The vendored copy is moved unmodified; it only uses relative imports internally. Imports inside the package are relative.
+  * **Loading.** `plasticity_c4d.pyp` loads the package with `importlib.util.spec_from_file_location("plasticity_bridge", …, submodule_search_locations=[…])`.
+    * It registers only that one name and never touches `sys.path`.
+    * If loading fails, it removes every module it loaded.
+    * A second installed copy of the plugin is reported, not unloaded.
+    * A foreign websockets is never used.
+  * **Dev reload (`PLASTICITY_BRIDGE_DEV=1`) is kept.** Re-running the `.pyp` drops every `plasticity_bridge.*` module and imports them fresh from disk.
+    * Why a fresh import: it resolves dependency order by itself. An ordered `importlib.reload` list would have to be maintained by hand, and in-place reloads leave stale cross-module references. A fresh import also reloads the vendored websockets together with the code that uses it.
+    * Without the variable, a re-run reuses the modules already loaded.
+    * Objects created before the reload (an open dialog, a live connection) keep running the old code, so disconnect first.
+* **Reproduction:** run `python -I repro_mcp.py <repo>` in a virtualenv with `websockets>=13` and `uvicorn[standard]`.
+  * On `b6d3cf5` it prints `leaked: ['websockets', 'core', 'dialogs']` and raises the `ServerProtocol` ImportError.
+  * Now it prints `leaked: []` and `MCP side OK`.
+* **Tests:**
+  * `test_plugin_entry.py`, each scenario in a `python -I` subprocess:
+    * `::test_entry_point_leaks_nothing_and_uses_private_websockets`
+    * `::test_mcp_stack_works_after_bridge_loads_first`: websockets ≥ 13 and uvicorn are imported after the bridge, and the bridge still completes a handshake in the same process.
+    * `::test_bridge_keeps_private_websockets_when_newer_one_loaded_first`: no warnings from the foreign copy.
+    * `::test_foreign_core_and_dialogs_packages_do_not_affect_bridge`
+    * `::test_failed_load_leaves_nothing_behind`
+    * `::test_second_installed_copy_is_reported_not_unloaded`
+    * `::test_running_the_pyp_again`
+  * `test_build_release.py::test_zip_layout_and_allowlist`: the zip root holds only the `.pyp`, `plasticity_bridge/`, `res/`, `LICENSE` and `readme.txt`.
+* **Manual checks:** the setup section, `M-MCP-1` and `M-DEV-1`.
+* **Upgrading:** the zip no longer contains `core/`, `dialogs/` or `libs/`. Unzipping over an old install leaves those folders behind. They aren't loaded any more, but they are confusing, so delete the old `PlasticityBridge` folder first.
 
 ### F45 — pre-1.1.0 scenes no longer migrated (regression in 1.1.6)
 

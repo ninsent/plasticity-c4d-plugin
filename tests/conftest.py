@@ -3,8 +3,9 @@ Test bootstrap.
 
 Cinema 4D's ``c4d`` module only exists inside Cinema 4D.  The suite installs
 the small stand-in from ``tests/stubs/c4d`` instead, and puts the repository
-root and the bundled ``libs/`` directory on ``sys.path`` exactly like
-``plasticity_c4d.pyp`` does at load time.
+root on ``sys.path`` so ``plasticity_bridge`` is importable by its full name.
+(Tests may touch ``sys.path``; the plugin itself never does — it loads the
+package by file location, see ``plasticity_c4d.pyp``.)
 """
 
 import os
@@ -16,8 +17,7 @@ import pytest
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
 
-for path in (os.path.join(TESTS_DIR, "stubs"), REPO_ROOT,
-             os.path.join(REPO_ROOT, "libs"), TESTS_DIR):
+for path in (os.path.join(TESTS_DIR, "stubs"), REPO_ROOT, TESTS_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 

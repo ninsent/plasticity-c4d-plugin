@@ -14,7 +14,7 @@ import c4d
 import math
 from c4d import plugins
 
-from core.refacet_settings import build_refacet_kwargs
+from .refacet_settings import build_refacet_kwargs
 
 # ---------------------------------------------------------------------------
 # Plugin ID — registered with Maxon.  Never change: scenes store tags by ID.
